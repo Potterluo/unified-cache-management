@@ -140,6 +140,31 @@ def get_supported_versions() -> list[str]:
     ]
 
 
+def _apply_version_adapter(version: str, *, fallback: Optional[object] = None) -> None:
+    """补丁收敛(9.1 阶段 4): 按版本查适配器注册表并应用。
+
+    已迁移版本(如 0.26.0)由 ``v0XYZ/adapter.py`` 统一驱动;未迁移版本走
+    调用方提供的 ``fallback``(旧 match 分支的 import 序列)。新版本适配
+    只需新增 adapter.py,不再修改本函数的版本分派。
+    """
+    from ucm.integration.vllm.patch.version_adapter import get_adapter
+
+    adapter = get_adapter(version)
+    if adapter is not None:
+        missing = adapter.verify_engine_patches()
+        if missing:
+            logger.warning(
+                f"Version adapter {version} missing engine patch archives: "
+                f"{', '.join(missing)}"
+            )
+        adapter.apply()
+        return
+    if fallback is not None:
+        fallback()
+        return
+    logger.warning(f"No version adapter for vLLM {version}; skipped.")
+
+
 def apply_all_patches() -> None:
     """Apply all vLLM patches based on detected version."""
     version: Optional[str] = None
@@ -282,8 +307,9 @@ def apply_all_patches() -> None:
                 import ucm.integration.vllm.patch.v0251.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0251.vllm_ascend.cpu_binding_patch
             case "0.26.0":
-                logger.info("UCM patching vllm-ascend 0.26.0 for CPU affinity...")
-                import ucm.integration.vllm.patch.v0260.vllm_ascend.cpu_binding_patch
+                # 补丁收敛(9.1 阶段 4)首个适配器: v0260/adapter.py 统一驱动。
+                logger.info("UCM patching vllm-ascend 0.26.0 via adapter...")
+                _apply_version_adapter("0.26.0")
             case "0.27.0":
                 # 0.27.0: no version-specific UCM patch yet. The Ascend hybrid
                 # prefix-cache fix (per-group AND / fixed-point truncation) has
