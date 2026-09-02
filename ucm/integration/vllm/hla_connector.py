@@ -68,10 +68,18 @@ class HLARequestMeta(RequestMeta):
 
 @dataclass
 class HLARequestDispatchMeta(RequestDispatchMeta):
-    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping."""
+    """Extends RequestDispatchMeta with full-attn block count for MLA rank scoping.
+
+    ``last_lcm_b`` / ``primary_prefix_hash``: 本步 mamba 状态实际落盘的 LCM
+    边界及其主组前缀哈希(4.3 检查点键 = (组, 位置, 前缀哈希))。由 SCHEDULER
+    侧 ``_generate_hla_dispatch_meta`` 计算并随 metadata 下发,worker
+    ``wait_for_save`` 登记时零推算。
+    """
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
+    last_lcm_b: int = 0
+    primary_prefix_hash: Optional[bytes] = None
 
 
 def layer_name_to_kv_cache_spec(
@@ -151,6 +159,60 @@ class GroupInfo:
         return not self.is_mamba_align
 
 
+def checkpoint_prefix_hash_for_position(
+    seq_len: int,
+    lcm_block_size: int,
+    primary_block_size: int,
+    primary_group_id: int,
+    group_block_ids: list[list[bytes]],
+) -> Optional[bytes]:
+    """快照检查点位置的前缀哈希纯函数(4.3 键里的"前缀哈希")。
+
+    取主 full-attn 组在 ``seq_len`` 位置的前缀块哈希作为该位置的前缀标识。
+    位置差一个 token,前缀哈希即不同,跨前缀错命不会发生。与
+    ``KVCacheGroupManager.checkpoint_prefix_hash`` 同源;独立成纯函数以便
+    worker 侧(无 group_manager)登记时复用同一计算。
+    """
+    if seq_len <= 0 or seq_len % lcm_block_size != 0:
+        return None
+    prefix_idx = seq_len // primary_block_size - 1
+    if prefix_idx < 0:
+        return None
+    try:
+        prefix_hash = group_block_ids[primary_group_id][prefix_idx]
+    except IndexError:
+        return None
+    return prefix_hash or None
+
+
+def group_geometry_from_kv_cache_config(
+    kv_cache_config: "KVCacheConfig",
+) -> tuple[int, list[tuple[int, int]], tuple[int, int]]:
+    """从 ``kv_cache_config`` 重建组几何: (lcm, [(组号, 网格)], (主组号, 块大小))。
+
+    worker 侧没有 ``KVCacheGroupManager``(仅 SCHEDULER 侧创建),但 stage-2
+    登记工作在 worker ``wait_for_save``;此函数以与 ``KVCacheGroupManager``
+    同源的方式(block_size_from_kv_cache_spec / is_mamba_align_kv_cache_spec /
+    math.lcm)重建几何,供登记使用。不涉及哈希种子与任何"懂模型"逻辑。
+    """
+    all_block_sizes: list[int] = []
+    state_groups: list[tuple[int, int]] = []
+    primary: Optional[tuple[int, int]] = None
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        block_size = block_size_from_kv_cache_spec(spec)
+        all_block_sizes.append(block_size)
+        if is_mamba_align_kv_cache_spec(spec):
+            state_groups.append((group_id, block_size))
+        elif primary is None:
+            primary = (group_id, block_size)
+    assert primary is not None, (
+        "UCMHybridLinearAttentionConnector expects at least one full-attention "
+        "group in kv_cache_config.kv_cache_groups."
+    )
+    return math.lcm(*all_block_sizes), state_groups, primary
+
+
 class KVCacheGroupManager:
     """Group-aware hashing and two-stage lookup for hybrid (HLA) connectors."""
 
@@ -207,14 +269,17 @@ class KVCacheGroupManager:
         # 阶段 2 快照目录(4.3 / 9.1 动手点③): 每个快照组一张检查点目录,
         # 键 = (组, 位置, 前缀哈希),惰性失效(不存有效标志,用时现算)。
         # 登记点在 worker wait_for_save(dump 落盘确认后);查询在 authoritative
-        # resolve_hit 的 p*(SCHEDULER 侧)。单进程 kv_both 下同一实例持有目录,
-        # 与报告 4.3 "目录由引擎侧写入、协调器持有" 一致。
-        from ucm.integration.vllm.kv_spec_table import CheckpointDirectory
+        # resolve_hit 的 p*(SCHEDULER 侧)。vLLM v1 单进程下 worker 与 SCHEDULER
+        # 各持一个 connector 实例,目录必须取进程内共享注册表(4.3 "目录由引擎侧
+        # 写入、协调器持有")-- 否则登记(worker)与查询(scheduler)各自 new 一个
+        # 目录,互相看不见,检查点目录恒空、p* 恒 0。
+        from ucm.integration.vllm.kv_spec_table import shared_checkpoint_directory
 
         self.snapshot_directories: dict[int, "CheckpointDirectory"] = {
-            sg.group_id: CheckpointDirectory(
-                group_name=str(sg.group_id),
-                grid_alignment=sg.block_size,
+            sg.group_id: shared_checkpoint_directory(
+                (self.lcm_block_size, sg.group_id),
+                str(sg.group_id),
+                sg.block_size,
             )
             for sg in self.state_groups
         }
@@ -321,17 +386,14 @@ class KVCacheGroupManager:
         ``seq_len`` 位置的前缀块哈希作为该位置的前缀标识。位置差一个 token,
         前缀哈希即不同,跨前缀错命不会发生。
         """
-        if seq_len <= 0 or seq_len % self.lcm_block_size != 0:
-            return None
         primary = self.full_attn_groups[0]
-        prefix_idx = seq_len // primary.block_size - 1
-        if prefix_idx < 0:
-            return None
-        try:
-            prefix_hash = group_block_ids[primary.group_id][prefix_idx]
-        except IndexError:
-            return None
-        return prefix_hash or None
+        return checkpoint_prefix_hash_for_position(
+            seq_len,
+            self.lcm_block_size,
+            primary.block_size,
+            primary.group_id,
+            group_block_ids,
+        )
 
     def register_snapshot_checkpoint(
         self,
@@ -1552,6 +1614,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         else:
             load_full_attn_count = 0
 
+        last_lcm_b = 0
         if req_meta.token_processed < req_meta.num_token_ids:
             dump_tok_start = req_meta.token_processed
             dump_tok_end = min(
@@ -1595,11 +1658,26 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
 
         req_meta.token_processed += new_tokens
 
+        # 本步 mamba 状态是否实际落盘: Pass-2 在 dump_tok_end == last_lcm_b 且
+        # last_lcm_b >= first_lcm_b 时才 append 状态块(见上),即
+        # dump 列表超出 full-attn 块的部分非空。登记检查点只需 (位置, 前缀哈希),
+        # 主组块哈希链在本请求的 ``req_meta.group_ucm_block_ids`` 里,由
+        # ``checkpoint_prefix_hash`` 提取 -- 与 authoritative 查询侧同源(4.3 位置键)。
+        last_lcm_b_carried = 0
+        primary_prefix_hash = None
+        if len(dump_ucm_block_ids) > dump_full_attn_count and last_lcm_b > 0:
+            last_lcm_b_carried = last_lcm_b
+            primary_prefix_hash = self.group_manager.checkpoint_prefix_hash(
+                last_lcm_b, req_meta.group_ucm_block_ids
+            )
+
         return HLARequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
             load_full_attn_count,
             dump_full_attn_count,
+            last_lcm_b_carried,
+            primary_prefix_hash,
         )
 
     def build_connector_meta(
@@ -2237,34 +2315,50 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
     ) -> None:
         """dump 落盘确认后,为本次计算的 LCM 边界登记快照检查点(4.3)。
 
-        HLA 的 mamba 状态只在 LCM 边界(last_lcm_b)落盘;这里对每个 dump 请求
-        在其 ``token_processed``(本步算到的边界)对齐 LCM 后,按快照组登记
-        (组, 位置, 前缀哈希)。登记仅当:
-        - 位置 > 0(位置 0 是"无检查点"哨兵);
-        - 该位置是 LCM 的整数倍(mamba 状态确实存在于此)。
+        ``metadata.request_meta`` 里的对象是 ``HLARequestDispatchMeta``(每步
+        调度一份,worker 经 bind_connector_metadata 获得),其 ``last_lcm_b`` /
+        ``primary_prefix_hash`` 由 SCHEDULER 侧 ``_generate_hla_dispatch_meta``
+        按 Pass-2 规则(状态只在 ``dump_tok_end == last_lcm_b`` 的边界落盘)算出
+        并随 metadata 下发 -- 与 authoritative 查询侧 ``checkpoint_prefix_hash``
+        同源(4.3 检查点键 = (组, 位置, 前缀哈希),位置差一个 token 前缀哈希即不同)。
+        这里只需把 (位置, 前缀哈希) 按快照组登记进进程内共享目录。登记仅当:
+        - ``last_lcm_b > 0``(本步确实落盘了 mamba 状态);
+        - 主组前缀哈希有效(块链确实覆盖该边界)。
         重复登记幂等(首次提交获胜,7.4 去重语义)。
+
+        worker 侧没有 ``group_manager``(仅 SCHEDULER 侧创建),几何从
+        ``_kv_cache_config`` 重建,目录取进程内共享注册表 -- 与 SCHEDULER 侧
+        authoritative 查询引用同一目录对象(4.3 "目录由引擎侧写入、协调器持有")。
         """
-        assert self.group_manager is not None
-        lcm = self.group_manager.lcm_block_size
-        state_group_ids = [sg.group_id for sg in self.group_manager.state_groups]
-        if not state_group_ids:
+        from ucm.integration.vllm.kv_spec_table import shared_checkpoint_directory
+
+        if self.group_manager is not None:
+            lcm = self.group_manager.lcm_block_size
+            state_groups = [
+                (sg.group_id, sg.block_size) for sg in self.group_manager.state_groups
+            ]
+        else:
+            assert self._kv_cache_config is not None
+            lcm, state_groups, _primary = group_geometry_from_kv_cache_config(
+                self._kv_cache_config
+            )
+        if not state_groups:
             return
 
         registered = 0
         for request_id, request in metadata.request_meta.items():
-            if not request.dump_block_ids or not request.dump_block_ids[0]:
+            boundary = request.last_lcm_b
+            prefix_hash = request.primary_prefix_hash
+            if boundary <= 0 or not prefix_hash:
                 continue
-            boundary = request.token_processed
-            # 对齐到 LCM 边界;非边界步不落盘 mamba 状态,不登记。
-            boundary = (boundary // lcm) * lcm
-            if boundary <= 0:
-                continue
-            for gid in state_group_ids:
+            for gid, grid in state_groups:
                 try:
-                    ok = self.group_manager.register_snapshot_checkpoint(
-                        gid, boundary, request.group_ucm_block_ids
+                    directory = shared_checkpoint_directory((lcm, gid), str(gid), grid)
+                    before = directory.positions(prefix_hash)
+                    directory.register(boundary, prefix_hash)
+                    registered += int(
+                        len(directory.positions(prefix_hash)) > len(before)
                     )
-                    registered += int(ok)
                 except Exception as e:
                     logger.error(
                         "register snapshot checkpoint error. "
@@ -2324,8 +2418,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                     )
         # 阶段 2(4.3): dump 落盘确认后登记快照检查点 (组, 位置, 前缀哈希)。
         # 仅登记"本步确实算到 LCM 边界"的状态位置(与 _generate_hla_dispatch_meta
-        # Pass-2 的 last_lcm_b 条件一致);重复登记幂等。
-        if dump_request_ids and self.group_manager is not None:
+        # Pass-2 的 last_lcm_b 条件一致);重复登记幂等。worker 侧无 group_manager,
+        # 几何/目录由 _register_snapshot_checkpoints_from_meta 内部按
+        # kv_cache_config + 共享注册表重建,不再依赖实例有无 group_manager。
+        if dump_request_ids:
             try:
                 metadata = self._get_connector_metadata()
                 assert isinstance(metadata, UCMConnectorMetadata)

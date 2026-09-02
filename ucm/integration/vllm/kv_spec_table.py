@@ -46,6 +46,7 @@ ucm 包),可在未构建 C++ 扩展的裸环境下直接用 pytest 单测
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Optional, Sequence
@@ -57,6 +58,7 @@ __all__ = [
     "SpecRow",
     "SpecTable",
     "CheckpointDirectory",
+    "shared_checkpoint_directory",
     "resolve_hit",
     "rank_block_present",
 ]
@@ -380,3 +382,37 @@ class CheckpointDirectory:
 
     # (前缀哈希, 边界位置) -> 该边界被"未见服务"的次数;目录内的簿记状态。
     _unserved: dict[tuple[bytes, int], int] = field(default_factory=dict)
+
+
+# 进程内共享检查点目录注册表(4.3 "目录由引擎侧写入、协调器持有")。
+#
+# vLLM v1 单进程(TP=1,worker 内联)下同一模块会被实例化两次: worker 侧
+# (save_kv_layer / wait_for_save,登记)与 SCHEDULER 侧(get_num_new_matched_tokens,
+# 查询)。若两侧各持一个 CheckpointDirectory,登记与查询互相看不见,目录恒空,
+# p* 恒为 0,外部命中被永久关闭(实测回归: stage-2 合入后 hit external 从 2 掉到 0)。
+# 以组几何指纹 (lcm_block_size, group_id) 做进程内 get-or-create,保证两侧引用
+# 同一目录对象。多进程部署时各进程持有自己的目录,与 4.3 "目录按引擎进程各自
+# 持有" 一致。
+_checkpoint_directory_registry: dict[tuple[int, int], "CheckpointDirectory"] = {}
+_checkpoint_directory_registry_lock = threading.Lock()
+
+
+def shared_checkpoint_directory(
+    group_key: tuple[int, int],
+    group_name: str,
+    grid_alignment: int,
+) -> "CheckpointDirectory":
+    """进程内共享的检查点目录(get-or-create)。
+
+    首次调用创建,后续调用(worker / scheduler 任一侧)返回同一对象。
+    ``group_key`` = (lcm_block_size, group_id),同模型两侧构造自同一
+    ``kv_cache_config``,指纹必然一致。
+    """
+    with _checkpoint_directory_registry_lock:
+        directory = _checkpoint_directory_registry.get(group_key)
+        if directory is None:
+            directory = CheckpointDirectory(
+                group_name=group_name, grid_alignment=grid_alignment
+            )
+            _checkpoint_directory_registry[group_key] = directory
+        return directory
