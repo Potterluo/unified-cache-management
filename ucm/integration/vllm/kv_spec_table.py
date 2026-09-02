@@ -179,6 +179,9 @@ def resolve_hit(
     checkpoints: Mapping[str, "CheckpointDirectory"],
     snapshot_prefix_ids: Optional[Mapping[str, bytes]] = None,
     candidate_L: Optional[int] = None,
+    *,
+    alignment: Optional[int] = None,
+    chain_row_filter: Optional[Callable[[SpecRow], bool]] = None,
 ) -> tuple[int, int]:
     """组件投票(4.2)的纯函数实现。
 
@@ -198,10 +201,18 @@ def resolve_hit(
             缺失的组视为无可用检查点(贡献 0)。
         candidate_L: 引擎本地匹配的候选长度,仅作首轮裁剪(报告伪代码中未参与
             计算,保留参数以待未来接入;当前不改变结果)。
+        alignment: 链式对齐刻度。缺省 = 规格表 LCM(公共刻度,4.2);FAWA 等
+            统一 canonical 哈希空间的连接器可传自己的哈希块刻度(其存储层
+            以 canonical 块为复用单位,再按 LCM 对齐会错误截断命中,见 6.2
+            ``storage_block_size`` 与 7.3 组块刻度的区分)。
+        chain_row_filter: 可选的行过滤谓词(如 FAWA 只让 FA 组参与链式投票,
+            窗口组经 ``lookup_on_reverse`` 单独裁决,见 hma_connector)。
     """
     _ = candidate_L  # 4.2 伪代码中 candidate_L 仅作首轮裁剪,当前不参与计算
 
     chain_rows = spec.chain_rows
+    if chain_row_filter is not None:
+        chain_rows = [row for row in chain_rows if chain_row_filter(row)]
     if not chain_rows:
         raise ValueError("resolve_hit 至少需要一个 chain 组(4.2)")
 
@@ -211,8 +222,9 @@ def resolve_hit(
         l_g = max(int(chain_existence(g, list(block_ids))), 0)
         l = min(l, l_g)
 
-    lcm = spec.lcm_block_size
-    l = (l // lcm) * lcm
+    grid = alignment if alignment is not None else spec.lcm_block_size
+    assert grid >= 1
+    l = (l // grid) * grid
 
     # 快照组: 跨组取最小(所有组的检查点都就位才可跳过 [0, p*))。
     if not spec.snapshot_rows:

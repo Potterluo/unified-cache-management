@@ -15,7 +15,10 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.device import create_device
-from ucm.integration.vllm.spec_table_builder import spec_table_double_run_enabled
+from ucm.integration.vllm.spec_table_builder import (
+    spec_table_authoritative_enabled,
+    spec_table_double_run_enabled,
+)
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     _check_shm_capacity,
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from ucm.integration.vllm.kv_spec_table import SpecRow
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -381,10 +385,15 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"group_metas={group_meta_summary}"
         )
 
-        # 双跑记账(4.4 C1 / 9.1 动手点①): 在 FAWA 侧也把胚胎表 KVCacheGroupMeta
-        # 与规格表逐组比对;旧逻辑为准,本块零行为变更,不一致仅告警+记指标。
+        # 规格表(4.1): DOUBLE_RUN(双跑记账)或 AUTHORITATIVE(切新主裁决)时构建。
+        # FAWA 的 canonical 哈希空间统一(不像 HLA 每组建独立哈希链),组件投票
+        # 在 FAWA 侧 = fa_store(FA 组)前缀 × wa_store(窗口组)边界 的两段查询
+        # (4.2 的 (l, p*) 形态);规格表在此提供组几何/刻度与记账载体。
         self._spec_table_double_run = None
-        if role == KVConnectorRole.SCHEDULER and spec_table_double_run_enabled():
+        if (
+            role == KVConnectorRole.SCHEDULER
+            and (spec_table_double_run_enabled() or spec_table_authoritative_enabled())
+        ):
             from ucm.integration.vllm.spec_table_builder import (
                 build_spec_table,
                 double_run_ledger,
@@ -850,6 +859,12 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             raise RuntimeError("FA store is not initialized.")
         if self.wa_store is None:
             raise RuntimeError("WA store is not initialized.")
+
+        # 切新(AUTHORITATIVE=1): 链式 l 由规格表 resolve_hit(组件投票,4.2)决定,
+        # WA 窗口边界(reverse)保留为快照 p* 的现状形态。旧逻辑转 shadow 记账。
+        if spec_table_authoritative_enabled() and self._spec_table_double_run is not None:
+            return self._lookup_external_hit_blocks_authoritative(external_keys)
+
         fa_hit_blocks = (
             self._rank_consistency.lookup_on_prefix(self.fa_store, external_keys) + 1
         )
@@ -860,6 +875,90 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         # form a prefix. Search only inside the FA-contiguous hit range and use
         # the latest boundary that exists.
         wa_keys = external_keys[:fa_hit_blocks]
+        reverse_idx = self._rank_consistency.lookup_on_reverse(self.wa_store, wa_keys)
+        if reverse_idx < 0:
+            return 0
+        return reverse_idx + 1
+
+    @staticmethod
+    def _fawa_row_group_id(row: "SpecRow") -> int:
+        """从规格表行名解析 FAWA 组号: 行名形如 ``mla0`` / ``group3``,尾号为组号。"""
+        name = row.group_name
+        digits = "".join(ch for ch in name if ch.isdigit())
+        return int(digits or -1)
+
+    def _lookup_external_hit_blocks_authoritative(
+        self,
+        external_keys: list[bytes],
+    ) -> int:
+        """FAWA authoritative(4.2 组件投票主裁决)。
+
+        FAWA 的 canonical 哈希空间统一(不像 HLA 每组建独立哈希链): FA 组共享
+        同一批 canonical 块,一个块存在 = 全部 FA 层该段都已落盘。因此链式 l
+        由 ``resolve_hit`` 对 **FA 组**(``chain_row_filter`` 仅保留 fa_group_ids)
+        组件投票决定,对齐刻度用 canonical ``hash_block_size``(复用单位)而非
+        规格表 LCM(各组 token_block_size 的 LCM 会把命中截到 0,见 6.2)。
+        WA 窗口组不是前缀数据,不参与链式投票;窗口边界经 ``lookup_on_reverse``
+        单独裁决(报告 5.2 的 p* 现状形态,目标态 = SnapshotStore 位置键)。
+
+        双跑记账: 新链式 l 与旧 fa_store.lookup_on_prefix 逐次比对,不一致
+        告警 + 记指标(4.4 C1 行为等价回归);执行以 resolve_hit 为准。
+        """
+        from ucm.integration.vllm.kv_spec_table import resolve_hit
+
+        spec = self._spec_table_double_run
+        if spec is None:
+            raise RuntimeError("FAWA authoritative requires a spec table.")
+
+        # canonical 哈希空间统一: 主刻度 = hash_block_size,规格表里的多个
+        # chain 行(FA 组)共享同一批 external keys。
+        prefix_hashes = {
+            row.group_name: list(external_keys) for row in spec.chain_rows
+        }
+
+        # 双跑记账的旧链式候选(FA 组前缀单一查询 = 旧 external_hit 的 fa 侧)。
+        legacy_fa_blocks = (
+            self._rank_consistency.lookup_on_prefix(self.fa_store, external_keys) + 1
+        )
+        legacy_fa_blocks = max(legacy_fa_blocks, 0)
+
+        def chain_existence(row: "SpecRow", block_ids: Sequence[bytes]) -> int:
+            # FAWA 统一 canonical 空间: 任一组的存在性 = fa_store 前缀命中块数。
+            # 按组切片查询会命中同一批 canonical keys(min 退化为单查询),与
+            # 存储语义一致 -- canonical 块存在 = 全部 FA 层该段已落盘。
+            fa_hit_blocks = (
+                self._rank_consistency.lookup_on_prefix(self.fa_store, list(block_ids))
+                + 1
+            )
+            return max(fa_hit_blocks, 0) * self.hash_block_size
+
+        def row_is_fa(row: "SpecRow") -> bool:
+            return self._fawa_row_group_id(row) in set(self.fa_group_ids)
+
+        total_hit_tokens, _ = resolve_hit(
+            spec,
+            prefix_hashes,
+            chain_existence,
+            {},
+            alignment=self.hash_block_size,
+            chain_row_filter=row_is_fa,
+        )
+        total_hit_blocks = total_hit_tokens // self.hash_block_size
+
+        # 双跑记账: 新链式 l 的块数 vs 旧 FA 前缀块数,不一致告警。
+        if total_hit_blocks != legacy_fa_blocks:
+            logger.warning(
+                "[double-run] FAWA authoritative l=%s blocks vs legacy fa=%s blocks "
+                "(num_external=%s)",
+                total_hit_blocks,
+                legacy_fa_blocks,
+                len(external_keys),
+            )
+            _record_counter("coordinator_spec_table_mismatches_total")
+
+        if total_hit_blocks <= 0:
+            return 0
+        wa_keys = external_keys[:total_hit_blocks]
         reverse_idx = self._rank_consistency.lookup_on_reverse(self.wa_store, wa_keys)
         if reverse_idx < 0:
             return 0

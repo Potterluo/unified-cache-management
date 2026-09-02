@@ -198,6 +198,64 @@ class ResolveHitTest(unittest.TestCase):
         l, p_star = resolve_hit(spec, ctx["prefix_hashes"], ctx["chain_existence"], {})
         self.assertEqual((l, p_star), (4096, 4096))
 
+    def test_alignment_override_canonical_grid_preserves_hits(self):
+        # FAWA 场景(4.2 对齐的适配): 链式组 token block 的 LCM 很大(如 DSV4
+        # mla1 组 4096),但 FAWA 存储层以 canonical hash 块(128)为复用单位,
+        # 命中必须保留 128 刻度 -- 用 alignment 覆盖 LCM,防止 4096 对齐把
+        # 3712 的命中截到 0。
+        spec = SpecTable(
+            [
+                SpecRow("mla0", CacheKind.CHAIN, 128),
+                SpecRow("mla1", CacheKind.CHAIN, 4096),
+            ]
+        )
+        self.assertEqual(spec.lcm_block_size, 4096)
+        # 两 FA 组共享同一 canonical 前缀: min(3712, 3712)。
+        ctx = self._lookup_ctx({"mla0": 3712, "mla1": 3712})
+
+        l_default, _ = resolve_hit(
+            spec, ctx["prefix_hashes"], ctx["chain_existence"], {}
+        )
+        # 缺省按规格表 LCM=4096 对齐: 3712 -> 0(命中被错误截断)。
+        self.assertEqual(l_default, 0)
+
+        l_grid, _ = resolve_hit(
+            spec,
+            ctx["prefix_hashes"],
+            ctx["chain_existence"],
+            {},
+            alignment=128,
+        )
+        # canonical 刻度 128 对齐: 3712 % 128 == 0 -> 保留。
+        self.assertEqual(l_grid, 3712)
+
+    def test_chain_row_filter_excludes_window_groups(self):
+        # FAWA 的窗口组(Tail/SWA)不是前缀数据,不参与链式投票(经
+        # lookup_on_reverse 单独裁决,见 hma_connector);row_filter 使其
+        # 从 resolve_hit 的 chain 投票中排除,避免窗口组把 l 拖成 0。
+        spec = SpecTable(
+            [
+                SpecRow("fa0", CacheKind.CHAIN, 128),
+                SpecRow("wa0", CacheKind.CHAIN, 32),
+            ]
+        )
+        ctx = self._lookup_ctx({"fa0": 3712, "wa0": 0})
+
+        l_default, _ = resolve_hit(
+            spec, ctx["prefix_hashes"], ctx["chain_existence"], {}
+        )
+        # 缺省窗口组参与投票: min(3712, 0) = 0,命中被窗口组抹掉。
+        self.assertEqual(l_default, 0)
+
+        l_filtered, _ = resolve_hit(
+            spec,
+            ctx["prefix_hashes"],
+            ctx["chain_existence"],
+            {},
+            chain_row_filter=lambda row: row.group_name == "fa0",
+        )
+        self.assertEqual(l_filtered, 3712)
+
     def test_snapshot_group_without_prefix_id_contributes_zero(self):
         spec = _xhybrid_96_spec_table()
         ctx = self._lookup_ctx({"mla": 4608, "csa_c16": 4480, "swa": 5000})
