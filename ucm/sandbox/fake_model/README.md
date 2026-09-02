@@ -66,19 +66,26 @@ moe_intermediate_size` 默认缩小若干倍(可用 `--keep-ffn` 取消),以降�
 ### 官方 config 获取优先级
 
 1. `official_configs/<model>.json`(本仓库已缓存,离线可用);
-2. `--fetch`:从 HuggingFace 官方仓库抓取并回写缓存;
+2. `--fetch`:从 HuggingFace 官方仓库抓取并回写缓存;**huggingface.co 不可达时自动换
+   `hf-mirror.com` 镜像兜底**(两者都失败才报错);`layer_plan.json` 的 `source` 会记录
+   `fetched_via: huggingface.co | hf-mirror.com`;
 3. 全部失败 → 内置"报告 6.1 口径"模板(`layer_plans.py` 的 `template_config`)。
 
-官方来源(2026-08 抓取):
+官方来源(2026-08 抓取;**DeepSeek-V4-Flash-0731 已双重确认**:
+HuggingFace 搜索结果中 `unsloth/…-GGUF`、`nvidia/…-NVFP4`、`bartowski/…-GGUF` 等
+量化仓库全部派生自 `deepseek-ai/DeepSeek-V4-Flash-0731`(unsloth GGUF 的
+`base_model` 字段),且量化仓库自身不携带 config.json——官方原始 config 即本缓存的
+`deepseek-v4.json`):
 
-| model_key | 官方仓库 | config URL | 缓存文件 | 字节 |
+| model_key | 官方仓库 | config URL | 缓存文件 | 大小 |
 |---|---|---|---|---|
-| deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/config.json> | deepseek-v4.json | 1 888 |
-| kimi-k3 | moonshotai/Kimi-K3 | <https://huggingface.co/moonshotai/Kimi-K3/resolve/main/config.json> | kimi-k3.json | 7 006 |
-| glm-5.3 | zai-org/GLM-5.3-Flash | <https://huggingface.co/zai-org/GLM-5.3-Flash/resolve/main/config.json> | glm-5.3.json | 69 416 |
+| deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/config.json> | deepseek-v4.json | ≈2.2 KB |
+| kimi-k3 | moonshotai/Kimi-K3 | <https://huggingface.co/moonshotai/Kimi-K3/resolve/main/config.json> | kimi-k3.json | ≈7 KB |
+| glm-5.3 | zai-org/GLM-5.3-Flash | <https://huggingface.co/zai-org/GLM-5.3-Flash/resolve/main/config.json> | glm-5.3.json | ≈69 KB |
 
 `layer_plan.json` 的 `source` 字段记录了所用来源(kind=official_config/template、URL、
-本地文件、sha256)。
+本地文件、sha256)。注:缓存是工具整理后的格式(json 内容与官方一致,字节排版可能
+与 HF 原样略有差异,以 `source.sha256`(规范化 JSON 哈希)为准)。
 
 ## 使用方式 (b):离线随机权重 safetensors(可选)
 
@@ -251,6 +258,12 @@ JSON;(g) safetensors 纯 stdlib 写读回。本机实测:Python 3.11.9 + pytest 
 8. **MoE 字段一致性**:缩小 `n_routed_experts / num_experts_per_tok` 时保证
    `per_tok ≤ routed`(工具已钳制),`topk_group/n_group/routed_expert_hidden_size`
    等成组字段别自相矛盾;`num_nextn_predict_layers`(DSV4/GLM 都有 MTP)保持官方值。
+9. **"减层可以,减 KV 形状不行"是本工具的纪律**:DSV4-0731 约 240-250B 参数,即使是
+   dummy 加载,attention 的 q/o 投影(64 头 × 512 head_dim)这类"KV 形状相关"的权重
+   依然巨大——想压显存只能缩 MoE/词表(`moe_intermediate_size`/`--shrink-vocab`),
+   `hidden_size/heads/head_dim/lora ranks/sliding_window/compress_ratios/indexer`
+   等字段一个字都不能动,否则引擎按层 spec 归组(`_get_kv_cache_groups_uniform_page_size`
+   式定点迭代)得出的 KVCacheConfig 分组就与真实模型不一致,验证就失去意义。
 
 ---
 

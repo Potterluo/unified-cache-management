@@ -194,6 +194,18 @@ class TestReducedConfig(unittest.TestCase):
         reduced = lp.reduce_config("deepseek-v4", cfg, 8)
         self.assertEqual(reduced["compress_ratios"], cfg["compress_ratios"][:8])
 
+    def test_quantization_config_stripped(self):
+        """(h) 缩减配置必须剥离官方量化配置(否则 --load-format dummy 走假量化)。"""
+        for model_key in MODELS:
+            with self.subTest(model=model_key):
+                cfg = _load_official(model_key)
+                reduced = lp.reduce_config(model_key, cfg, 8)
+                self.assertNotIn("quantization_config", reduced)
+                self.assertNotIn("quant_method", reduced)
+                text = reduced.get("text_config") or {}
+                self.assertNotIn("quantization_config", text)
+                self.assertNotIn("quant_method", text)
+
     def test_ffn_shrunk_cap(self):
         cfg = _load_official("deepseek-v4")
         reduced = lp.reduce_config("deepseek-v4", cfg, 8)
@@ -326,6 +338,23 @@ class TestCliRuns(unittest.TestCase):
     def test_unknown_model_rejected(self):
         with self.assertRaises(ValueError):
             lp.resolve_model_key("qwen-not-a-real-model")
+
+
+class TestMirrorFallback(unittest.TestCase):
+    """hf-mirror.com 兜底 URL 映射(纯函数,不联网;--fetch 路径在 CLI 测试外手工验证)。"""
+
+    def test_mirror_url_mapping(self):
+        self.assertEqual(
+            build_fake_model._mirror_url(
+                "https://huggingface.co/a/b/resolve/main/config.json"
+            ),
+            "https://hf-mirror.com/a/b/resolve/main/config.json",
+        )
+        self.assertEqual(
+            build_fake_model._mirror_url("https://hf-mirror.com/a/b"),
+            "https://hf-mirror.com/a/b",
+        )
+        self.assertIsNone(build_fake_model._mirror_url("https://example.com/x.json"))
 
 
 class TestFakeWeights(unittest.TestCase):

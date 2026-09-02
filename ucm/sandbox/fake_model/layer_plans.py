@@ -723,6 +723,13 @@ def reduce_config(
     if n_layers < 1:
         raise ValueError(f"--layers 必须 >=1,实际 {n_layers}")
     c = copy.deepcopy(cfg)
+    # 假模型只验证 KV 结构: 剥离官方量化配置,避免 vllm --load-format dummy
+    # 走(假)量化权重路径,在 Ascend NPU 权重拷贝时报
+    # aclnnInplaceCopy(561103) 之类的错误(实测 DSV4-Flash 假配置卡点,README 见)。
+    for scope in (c, c.get("text_config") or {}, c.get("vision_config") or {}):
+        if isinstance(scope, dict):
+            scope.pop("quantization_config", None)
+            scope.pop("quant_method", None)
     n_orig = _original_layer_count(model_key, c)
 
     if model_key == "deepseek-v4":
