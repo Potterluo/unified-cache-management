@@ -1506,19 +1506,21 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         state_idx = max((seq_len - 1) // group.block_size, 0)
         vllm_state_idx = state_idx
         if reason == "load":
-            # load 侧状态必须写到"引擎眼里的最后一块"(2.2: 运行中的状态总记在
-            # 最后一个块上)。resume 请求按完整序列分配块(如 3402 token -> 3 块
-            # [0,10,15]),引擎从续算点(如 3072)接着写时读的是**最后一块**
-            # (idx 2 = 块 15),不是 ``state_idx``(3072 所在块 idx 1)。
-            # dump 侧相反: dump 发生时序列只到 last_lcm_b(如 3072,共 2 块
-            # [3,6]),"最后一块"就是 idx 1 = ``state_idx`` -- dump 侧取
-            # ``state_idx`` 本就正确。两侧语义都是"序列最后一块",实现不同:
-            # dump 在短序列上取,load 在完整序列上取。
-            block_ids = req_meta.group_vllm_block_ids[gid]
-            for i in range(len(block_ids) - 1, -1, -1):
-                if block_ids[i] != 0:
-                    vllm_state_idx = i
-                    break
+            # load 侧状态写到 **prev_state_idx 对应块**(state_idx),实测裁决:
+            # ascend 版 preprocess_mamba 在 resume 第一步算出
+            #   prev_state_idx = (num_computed_tokens - 1) // block_size (=1)
+            #   curr_state_idx = num_blocks - 1 (=2)
+            # prev != curr 时 collect_mamba_copy_meta=True(探针 off=96)--
+            # 元数据 src=prev 块、dst=curr 块;forward 前 do_mamba_copy_block
+            # 把状态从 **prev 块** 拷到 curr 块再使用。因此 load 必须把
+            # 磁盘状态写回 prev 块(=state_idx),引擎 copy 才把正确状态带进
+            # 后续计算;若写在 curr 块(最后一块),会被引擎 copy(从空/旧
+            # prev 块)覆盖成垃圾 -> 状态错乱 -> 错命(静默错误输出)。
+            # dump 侧反之: dump 发生在 forward 之后(状态已留在本步末尾块),
+            # 恰是引擎同一步的 state_idx 块 -- 两侧语义一致(2.2: 状态存
+            # 在序列当前末尾的块上),load 用 resume 请求的 prev 块 = state_idx。
+            # 状态块写入 prev 块: 与 dump 侧的 state_idx 对称(见上)
+            pass
         try:
             vllm_block_id = req_meta.group_vllm_block_ids[gid][vllm_state_idx]
         except IndexError:
@@ -2220,21 +2222,20 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
 
         if self.need_load and self.row_ids:
-            # Ensure do_mamba_copy_block (from preprocess_mamba, compute stream)
-            # has completed before submitting load DMA (store stream).  Without
-            # this, the copy may land after the load and clobber loaded data.
-            # At this point the previous step's forward is done, so the only
-            # pending compute op is the mamba state copy — sync overhead is
-            # negligible.
+            # 正确性优先(8/8 精度实测): mamba 状态必须在**第一次 forward 前**
+            # 全部就绪 -- ascend 版 preprocess_mamba 只记录 copy 元数据、不真正
+            # 迁移("do not copy here, since kv_transfer still not load"),
+            # do_mamba_copy_block 在本步 forward 前执行,引擎直接从 curr 块读状态。
+            # layerwise 的"逐行流水"与"第一步前全量就绪"在此冲突: 若只等 row 0,
+            # 状态块所在行(常为更靠后的行)的 load DMA 未完成,引擎读到旧/空状态
+            # -> 间歇错命。因此提交**全部行** load 并**全部等待**;load 完成后再
+            # add device.synchronize 确保 store stream 落定(compute->store 全序)。
             self.device.synchronize()
-            # vLLM only calls wait_for_layer_load at full_attn (last layer of
-            # each row), so row 0 must be loaded here before linear_attn begins.
-            num_submit = min(self._load_prefetch_rows + 1, len(self.row_ids))
-            for idx in range(num_submit):
+            for idx in self.row_ids:
                 self._submit_request_load_tasks_for_row_once(idx, metadata)
-            self._wait_row_load(0, metadata)
-            if len(self.row_ids) == 1:
-                self._record_layerwise_load_bytes()
+            for idx in self.row_ids:
+                self._wait_row_load(idx, metadata)
+            self._record_layerwise_load_bytes()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata or not self.need_load:
