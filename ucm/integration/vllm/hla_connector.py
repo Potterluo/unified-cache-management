@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.spec_table_builder import spec_table_double_run_enabled
 from ucm.integration.vllm.ucm_connector import (
     KVCacheLayout,
     PendingDumpTask,
@@ -209,6 +210,28 @@ class KVCacheGroupManager:
             f"{[(g.group_id, g.block_size, g.is_mamba_align) for g in self.state_groups]}"
         )
 
+        # 双跑记账(4.4 C1): UCM_SPEC_TABLE_DOUBLE_RUN=1 时用规格表复建组信息,
+        # 与旧 GroupInfo 逐组比对;旧逻辑为准,本块零行为变更,不一致仅告警+记指标。
+        self._spec_table_double_run = None
+        if spec_table_double_run_enabled():
+            from ucm.integration.vllm.spec_table_builder import (
+                build_spec_table,
+                double_run_ledger,
+            )
+
+            seeds = [g.seed.hex() for g in self.groups_by_id]
+            self._spec_table_double_run = build_spec_table(
+                kv_cache_config.kv_cache_groups, group_seeds=seeds
+            )
+            logger.info(
+                "[double-run] spec table:\n%s", repr(self._spec_table_double_run)
+            )
+            for msg in double_run_ledger(
+                self._spec_table_double_run, self.groups_by_id
+            ):
+                logger.warning("[double-run] %s", msg)
+                _record_counter("coordinator_spec_table_mismatches_total")
+
     @property
     def num_groups(self) -> int:
         return len(self.groups_by_id)
@@ -270,6 +293,110 @@ class KVCacheGroupManager:
         )
 
     def lookup_external_hit_tokens(
+        self,
+        num_computed_tokens: int,
+        group_block_ids: list[list[bytes]],
+        lookup_on_prefix: Callable[[list[bytes]], int],
+        lookup_on_reverse: Callable[[list[bytes]], int],
+    ) -> tuple[int, int, list[bytes]]:
+        """Two-stage HLA lookup(旧逻辑为准)。
+
+        双跑开启(UCM_SPEC_TABLE_DOUBLE_RUN=1)时,额外用规格表 + ``resolve_hit``
+        复算链式命中长度并记账比对(4.4 C2 的行为等价回归);旧逻辑结果不变。
+        """
+        result = self._lookup_external_hit_tokens_legacy(
+            num_computed_tokens,
+            group_block_ids,
+            lookup_on_prefix,
+            lookup_on_reverse,
+        )
+        if spec_table_double_run_enabled():
+            try:
+                self._double_run_shadow_resolve(
+                    num_computed_tokens,
+                    group_block_ids,
+                    lookup_on_prefix,
+                    result,
+                )
+            except Exception as e:  # 双跑失败不影响旧逻辑(记账是附加动作)
+                logger.error(
+                    "[double-run] shadow resolve_hit failed. %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+        return result
+
+    def _double_run_shadow_resolve(
+        self,
+        num_computed_tokens: int,
+        group_block_ids: list[list[bytes]],
+        lookup_on_prefix: Callable[[list[bytes]], int],
+        legacy_result: tuple[int, int, list[bytes]],
+    ) -> None:
+        """双跑: 用 ``resolve_hit`` 复算链式命中长度,与旧 lookup 对齐比对。
+
+        一致性目标: 新 ``l`` == 旧链式候选(全部 full-attn 组的 min,floor LCM)。
+        快照检查点目录属阶段 2(SnapshotStore),此处不比对 ``p*``(旧 reverse-scan
+        把状态折进哈希,新位置键语义差异留待阶段 2 落地后回归)。
+        """
+        if self._spec_table_double_run is None:
+            return
+        from ucm.integration.vllm.kv_spec_table import (
+            CheckpointDirectory,
+            resolve_hit,
+        )
+
+        spec = self._spec_table_double_run
+        row_ids = {row.group_name: i for i, row in enumerate(spec.rows)}
+        checkpoints = {
+            s.group_name: CheckpointDirectory(s.group_name) for s in spec.snapshot_rows
+        }
+
+        def existence_by_chain(row, block_ids):
+            gi = row_ids[row.group_name]
+            bs = row.block_size
+            external = group_block_ids[gi][num_computed_tokens // bs :]
+            if not external:
+                return num_computed_tokens
+            hit_blocks = lookup_on_prefix(external) + 1
+            return num_computed_tokens + max(hit_blocks, 0) * bs
+
+        new_l, _ = resolve_hit(spec, {}, existence_by_chain, checkpoints)
+
+        # 旧逻辑的链式候选只来自 full-attn 组(与规格表 chain 行同集)。
+        legacy_chain_l = num_computed_tokens
+        for fa in self.full_attn_groups:
+            bs = fa.block_size
+            external = group_block_ids[fa.group_id][num_computed_tokens // bs :]
+            if not external:
+                abs_exists = num_computed_tokens
+            else:
+                hit_blocks = lookup_on_prefix(external) + 1
+                abs_exists = num_computed_tokens + max(hit_blocks, 0) * bs
+            legacy_chain_l = min(legacy_chain_l, abs_exists)
+        legacy_chain_l = (legacy_chain_l // self.lcm_block_size) * self.lcm_block_size
+
+        if new_l != legacy_chain_l:
+            logger.warning(
+                "[double-run] resolve_hit l=%s != legacy chain l=%s "
+                "(num_computed=%s), spec.lcm=%s vs legacy.lcm=%s",
+                new_l,
+                legacy_chain_l,
+                num_computed_tokens,
+                spec.lcm_block_size,
+                self.lcm_block_size,
+            )
+            _record_counter("coordinator_spec_table_mismatches_total")
+        elif spec.snapshot_rows:
+            logger.debug(
+                "[double-run] chain l 一致(l=%s);snapshot p* 比对待阶段 2"
+                "(SnapshotStore + 检查点目录)后回归。",
+                new_l,
+            )
+        else:
+            logger.debug("[double-run] resolve_hit 与 legacy 一致 l=%s", new_l)
+
+    def _lookup_external_hit_tokens_legacy(
         self,
         num_computed_tokens: int,
         group_block_ids: list[list[bytes]],
@@ -983,17 +1110,19 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         else:
             lookup_block_ids = group_ucm_block_ids
 
-        external_hit_tokens, external_hit_lcm_blocks, mamba_prefetch_hashes = (
-            self.group_manager.lookup_external_hit_tokens(
-                num_computed_tokens,
-                lookup_block_ids,
-                lambda block_ids: self._rank_consistency.lookup_on_prefix(
-                    self.store, block_ids
-                ),
-                lambda block_ids: self._rank_consistency.lookup_on_reverse(
-                    self.store, block_ids
-                ),
-            )
+        (
+            external_hit_tokens,
+            external_hit_lcm_blocks,
+            mamba_prefetch_hashes,
+        ) = self.group_manager.lookup_external_hit_tokens(
+            num_computed_tokens,
+            lookup_block_ids,
+            lambda block_ids: self._rank_consistency.lookup_on_prefix(
+                self.store, block_ids
+            ),
+            lambda block_ids: self._rank_consistency.lookup_on_reverse(
+                self.store, block_ids
+            ),
         )
 
         if (
