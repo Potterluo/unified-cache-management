@@ -61,6 +61,7 @@ SpecTable = kv_spec_table.SpecTable
 CheckpointDirectory = kv_spec_table.CheckpointDirectory
 resolve_hit = kv_spec_table.resolve_hit
 rank_block_present = kv_spec_table.rank_block_present
+deepest_snapshot_p_star = kv_spec_table.deepest_snapshot_p_star
 NO_CHECKPOINT = kv_spec_table.NO_CHECKPOINT
 
 
@@ -325,6 +326,87 @@ class CheckpointDirectoryTest(unittest.TestCase):
         self.assertEqual(d.deepest_candidate(5000, prefix), 5000)
         # 第三次出现不再新建。
         self.assertFalse(d.on_unserved_seen(prefix, 5000))
+
+
+class DeepestSnapshotPStarTest(unittest.TestCase):
+    """4.3 目录驱动 p* 纯函数: 最深 ≤ l 且所有快照组齐备的位置。
+
+    检查点前缀哈希随位置链式变化(位置隔离): 位置 p 只对该位置自己的前缀哈希
+    可见;所有快照组在同一 p 都登记过才推进。
+    """
+
+    def _prefix_at(self, hashes_by_pos):
+        def prefix_at(position):
+            return hashes_by_pos.get(position)
+        return prefix_at
+
+    def test_deepest_across_all_snapshot_groups(self):
+        # 两组快照: 在 4096 都登记 -> p* = 4096;4608 只有一组 -> 不可用。
+        m2 = CheckpointDirectory("m2")
+        kda = CheckpointDirectory("kda")
+        prefix_4096, prefix_4608 = b"h4096", b"h4608"
+        m2.register(4096, prefix_4096)
+        m2.register(4608, prefix_4608)
+        kda.register(4096, prefix_4096)  # kda 在 4608 缺失
+        p_star = deepest_snapshot_p_star(
+            {"m2": m2, "kda": kda},
+            self._prefix_at({4096: prefix_4096, 4608: prefix_4608}),
+            num_computed_tokens=0,
+            total_hit_tokens=4608,
+            lcm_block_size=128,
+        )
+        self.assertEqual(p_star, 4096)
+
+    def test_cross_prefix_isolation_by_position_hash(self):
+        # 同一位置不同前缀哈希: 目录项对不上 -> 不可用(位置对、内容错不命中)。
+        d = CheckpointDirectory("m2")
+        d.register(4096, b"prefix-A-at-4096")
+        p_star = deepest_snapshot_p_star(
+            {"m2": d},
+            self._prefix_at({4096: b"prefix-B-at-4096"}),
+            num_computed_tokens=0,
+            total_hit_tokens=4096,
+            lcm_block_size=128,
+        )
+        self.assertEqual(p_star, 0)  # NO_CHECKPOINT -> 状态重推
+
+    def test_no_checkpoint_below_l_returns_computed(self):
+        d = CheckpointDirectory("m2")
+        d.register(1024, b"h1024")
+        # 链式候选 4096,但最深已登记检查点只有 1024 -> p* = 1024。
+        p_star = deepest_snapshot_p_star(
+            {"m2": d},
+            self._prefix_at({1024: b"h1024", 4096: b"h4096"}),
+            num_computed_tokens=0,
+            total_hit_tokens=4096,
+            lcm_block_size=128,
+        )
+        self.assertEqual(p_star, 1024)
+
+    def test_empty_directories_returns_total_hit(self):
+        p_star = deepest_snapshot_p_star(
+            {},
+            self._prefix_at({}),
+            num_computed_tokens=0,
+            total_hit_tokens=4096,
+            lcm_block_size=128,
+        )
+        self.assertEqual(p_star, 4096)
+
+    def test_partial_prefix_hash_skips_position(self):
+        # 前缀哈希在某个位置缺失(链式块被淘汰) -> 该位置跳过(惰性失效)。
+        m2 = CheckpointDirectory("m2")
+        m2.register(4096, b"h4096")
+        m2.register(4608, b"h4608")
+        # prefix_at(4608) 返回 None => 4608 不可用,退化到 4096。
+        p_star = deepest_snapshot_p_star(
+            {"m2": m2},
+            self._prefix_at({4096: b"h4096"}),
+            num_computed_tokens=0,
+            total_hit_tokens=4608,
+            lcm_block_size=128,
+        )
+        self.assertEqual(p_star, 4096)
 
 
 if __name__ == "__main__":

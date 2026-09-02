@@ -242,6 +242,51 @@ def rank_block_present(rule: RankRule, dump_success: Sequence[bool]) -> bool:
     raise ValueError(f"未知秩规则: {rule!r}")
 
 
+def deepest_snapshot_p_star(
+    directories: Mapping[str, "CheckpointDirectory"],
+    prefix_at_position: Callable[[int], Optional[bytes]],
+    num_computed_tokens: int,
+    total_hit_tokens: int,
+    lcm_block_size: int,
+) -> int:
+    """检查点目录驱动的快照 p*(4.3)纯函数: "最深的 ≤ l 且前缀链匹配"。
+
+    检查点键 = (组, 位置, 前缀哈希),且前缀哈希随位置链式变化: 位置 p 的检查点
+    只对"前缀哈希链匹配到 p"的请求可见。因此从链式候选 ``total_hit_tokens``
+    向下逐 LCM 边界扫描,每个候选位置用该位置自己的链式前缀哈希
+    (``prefix_at_position(p)``,由调用方按主链式组派生)查询**所有**快照组目录;
+    所有组在同一个 p 都登记过,该 p 才可用(跨组取最小的语义,4.2 ④′),返回
+    最深者。无快照目录 / 无可用位置时返回 ``num_computed_tokens``(状态重推,
+    漏命安全)。
+
+    惰性失效天然成立: 链式块被淘汰 => ``prefix_at_position(p)`` 对应的链或
+    目录项不再完整 => 查不到 => 自动够不着,零通知零跨层协议(4.3)。
+
+    Args:
+        directories: 按快照组名 -> 检查点目录(鸭子类型 ``positions(prefix)``)。
+        prefix_at_position: 位置 -> 该位置的前缀哈希(链式,随位置变化)。
+        num_computed_tokens: 引擎本地已算 token 数(下界)。
+        total_hit_tokens: 链式候选绝对位置(上界,即 l)。
+        lcm_block_size: 快照边界网格(与链式 LCM 对齐)。
+    """
+    if not directories:
+        return total_hit_tokens
+    for p in range(total_hit_tokens, num_computed_tokens - 1, -lcm_block_size):
+        if p <= num_computed_tokens:
+            continue
+        prefix_hash = prefix_at_position(p)
+        if not prefix_hash:
+            continue
+        all_groups_ready = True
+        for directory in directories.values():
+            if p not in directory.positions(prefix_hash):
+                all_groups_ready = False
+                break
+        if all_groups_ready:
+            return p
+    return num_computed_tokens
+
+
 @dataclass
 class CheckpointDirectory:
     """快照组检查点目录(4.3)。

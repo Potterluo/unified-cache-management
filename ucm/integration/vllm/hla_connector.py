@@ -204,6 +204,21 @@ class KVCacheGroupManager:
                 f"state groups."
             )
 
+        # 阶段 2 快照目录(4.3 / 9.1 动手点③): 每个快照组一张检查点目录,
+        # 键 = (组, 位置, 前缀哈希),惰性失效(不存有效标志,用时现算)。
+        # 登记点在 worker wait_for_save(dump 落盘确认后);查询在 authoritative
+        # resolve_hit 的 p*(SCHEDULER 侧)。单进程 kv_both 下同一实例持有目录,
+        # 与报告 4.3 "目录由引擎侧写入、协调器持有" 一致。
+        from ucm.integration.vllm.kv_spec_table import CheckpointDirectory
+
+        self.snapshot_directories: dict[int, "CheckpointDirectory"] = {
+            sg.group_id: CheckpointDirectory(
+                group_name=str(sg.group_id),
+                grid_alignment=sg.block_size,
+            )
+            for sg in self.state_groups
+        }
+
         logger.info(
             "KVCacheGroupManager initialized: "
             f"lcm_block_size={self.lcm_block_size}, "
@@ -295,6 +310,80 @@ class KVCacheGroupManager:
             (group.seed, b"UCM_MAMBA_ALIGN_STATE", seq_len, prefix_hash)
         )
 
+    def checkpoint_prefix_hash(
+        self,
+        seq_len: int,
+        group_block_ids: list[list[bytes]],
+    ) -> Optional[bytes]:
+        """快照组检查点目录的前缀哈希(4.3 键 = (组, 位置, 前缀哈希))。
+
+        与 ``compute_mamba_align_state_hash`` 同源: 取主 full-attn 组在
+        ``seq_len`` 位置的前缀块哈希作为该位置的前缀标识。位置差一个 token,
+        前缀哈希即不同,跨前缀错命不会发生。
+        """
+        if seq_len <= 0 or seq_len % self.lcm_block_size != 0:
+            return None
+        primary = self.full_attn_groups[0]
+        prefix_idx = seq_len // primary.block_size - 1
+        if prefix_idx < 0:
+            return None
+        try:
+            prefix_hash = group_block_ids[primary.group_id][prefix_idx]
+        except IndexError:
+            return None
+        return prefix_hash or None
+
+    def register_snapshot_checkpoint(
+        self,
+        group_id: int,
+        position: int,
+        group_block_ids: list[list[bytes]],
+        prefix_hash: Optional[bytes] = None,
+    ) -> bool:
+        """登记一个快照检查点(4.3 保留策略触发点由调用方决定)。
+
+        只在 dump 落盘确认后调用(worker ``wait_for_save``),登记 (组, 位置,
+        前缀哈希);重复登记幂等。返回是否新建。
+        """
+        directory = self.snapshot_directories.get(group_id)
+        if directory is None:
+            return False
+        if prefix_hash is None:
+            prefix_hash = self.checkpoint_prefix_hash(position, group_block_ids)
+        if not prefix_hash:
+            return False
+        before = directory.positions(prefix_hash)
+        directory.register(position, prefix_hash)
+        return len(directory.positions(prefix_hash)) > len(before)
+
+    def snapshot_p_star_from_directory(
+        self,
+        num_computed_tokens: int,
+        total_hit_tokens: int,
+        group_block_ids: list[list[bytes]],
+    ) -> int:
+        """目录驱动的快照 p*(4.3): "最深的 ≤ l 且前缀链匹配" 的位置。
+
+        退化为协调器纯函数 ``deepest_snapshot_p_star``(kv_spec_table): 对每个
+        候选位置 p 用该位置自己的链式前缀哈希(主 full-attn 组在 p 的前缀哈希,
+        位置相关,天然隔离跨前缀)查询所有快照组目录,全组齐备才可用。返回绝对
+        位置,语义与旧 Stage-2 reverse-scan 的 ``best_pos`` 一致,供双跑记账
+        比对(阶段 2 目录语义回归)。
+        """
+        from ucm.integration.vllm.kv_spec_table import deepest_snapshot_p_star
+
+        directories = {
+            str(gid): directory
+            for gid, directory in self.snapshot_directories.items()
+        }
+        return deepest_snapshot_p_star(
+            directories,
+            lambda p: self.checkpoint_prefix_hash(p, group_block_ids),
+            num_computed_tokens,
+            total_hit_tokens,
+            self.lcm_block_size,
+        )
+
     def lookup_external_hit_tokens(
         self,
         num_computed_tokens: int,
@@ -365,17 +454,21 @@ class KVCacheGroupManager:
         lookup_on_prefix: Callable[[list[bytes]], int],
         lookup_on_reverse: Callable[[list[bytes]], int],
     ) -> tuple[int, int, list[bytes]]:
-        """Authoritative: 链式 l 由 ``resolve_hit`` 决定,快照 p* 仍旧 reverse scan。
+        """Authoritative: 链式 l 由 ``resolve_hit`` 决定,快照 p* 检查点目录主裁决。
 
         规格表(``self._spec_table_double_run``)必须非 None(由
         ``KVCacheGroupManager`` 初始化;否则退化为 legacy)。
+
+        双跑语义(4.4 C1 / 4.3 惰性失效):
+        - 链式 l: resolve_hit 组件投票(4.2);
+        - 快照 p*: ``KVCacheGroupManager.snapshot_p_star_from_directory``
+          (目录,惰性失效)。执行以目录 p* 为准;旧 Stage-2 reverse-scan 的
+          ``best_pos`` 作 shadow 记账比对,不一致告警(不改变执行结果)。
         """
-        from ucm.integration.vllm.kv_spec_table import CheckpointDirectory, resolve_hit
+        from ucm.integration.vllm.kv_spec_table import resolve_hit
 
         spec = self._spec_table_double_run
         row_ids = {row.group_name: i for i, row in enumerate(spec.rows)}
-        # 阶段 1 快照检查点目录为空(阶段 2 才接入 SnapshotStore);这里只需
-        # resolve_hit 的链式 l,快照 p* 仍由旧 Stage-2 reverse scan 决定。
         checkpoints = {}
 
         def existence_by_chain(row, block_ids):
@@ -392,12 +485,50 @@ class KVCacheGroupManager:
         # 对齐:resolve_hit 已对 LCM 向下取整,但保守再对齐一次。
         chain_l = (chain_l // self.lcm_block_size) * self.lcm_block_size
 
-        return self._lookup_external_hit_tokens_legacy(
+        legacy_result = self._lookup_external_hit_tokens_legacy(
             num_computed_tokens,
             group_block_ids,
             lookup_on_prefix,
             lookup_on_reverse,
             chain_absolute_l=chain_l,
+        )
+        legacy_external_hit_tokens = legacy_result[0]
+
+        # 快照 p* 主裁决: 检查点目录(惰性失效)。p* 之后的状态重推由引擎按
+        # (l, p*) 分段执行;这里把 external hit 收窄到目录确认的 p*。
+        if self.group_manager is not None and not self.group_manager.state_groups:
+            # 无快照组: p* = 链式候选,目录不参与。
+            return legacy_result
+
+        total_hit_tokens = num_computed_tokens + legacy_external_hit_tokens
+        dir_p_star = (
+            self.group_manager.snapshot_p_star_from_directory(
+                num_computed_tokens, total_hit_tokens, group_block_ids
+            )
+            if self.group_manager is not None
+            else total_hit_tokens
+        )
+        dir_external_hit_tokens = max(dir_p_star - num_computed_tokens, 0)
+
+        # 双跑记账: 目录 p* vs 旧 reverse-scan best_pos(即 legacy external)。
+        if legacy_external_hit_tokens != dir_external_hit_tokens:
+            logger.warning(
+                "[authoritative] snapshot p*: directory=%s vs legacy=%s "
+                "(num_computed=%s, chain_l=%s)",
+                dir_p_star,
+                total_hit_tokens,
+                num_computed_tokens,
+                chain_l,
+            )
+            _record_counter("coordinator_spec_table_mismatches_total")
+
+        if dir_external_hit_tokens <= 0:
+            return 0, 0, []
+        mamba_prefetch_hashes = legacy_result[2]
+        return (
+            dir_external_hit_tokens,
+            dir_external_hit_tokens // self.lcm_block_size,
+            mamba_prefetch_hashes,
         )
 
     def _double_run_shadow_resolve(
@@ -2104,6 +2235,50 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 f"{type(e).__name__}: {e}"
             )
 
+    def _register_snapshot_checkpoints_from_meta(
+        self, metadata: "UCMConnectorMetadata"
+    ) -> None:
+        """dump 落盘确认后,为本次计算的 LCM 边界登记快照检查点(4.3)。
+
+        HLA 的 mamba 状态只在 LCM 边界(last_lcm_b)落盘;这里对每个 dump 请求
+        在其 ``token_processed``(本步算到的边界)对齐 LCM 后,按快照组登记
+        (组, 位置, 前缀哈希)。登记仅当:
+        - 位置 > 0(位置 0 是"无检查点"哨兵);
+        - 该位置是 LCM 的整数倍(mamba 状态确实存在于此)。
+        重复登记幂等(首次提交获胜,7.4 去重语义)。
+        """
+        assert self.group_manager is not None
+        lcm = self.group_manager.lcm_block_size
+        state_group_ids = [sg.group_id for sg in self.group_manager.state_groups]
+        if not state_group_ids:
+            return
+
+        registered = 0
+        for request_id, request in metadata.request_meta.items():
+            if not request.dump_block_ids or not request.dump_block_ids[0]:
+                continue
+            boundary = request.token_processed
+            # 对齐到 LCM 边界;非边界步不落盘 mamba 状态,不登记。
+            boundary = (boundary // lcm) * lcm
+            if boundary <= 0:
+                continue
+            for gid in state_group_ids:
+                try:
+                    ok = self.group_manager.register_snapshot_checkpoint(
+                        gid, boundary, request.group_ucm_block_ids
+                    )
+                    registered += int(ok)
+                except Exception as e:
+                    logger.error(
+                        "register snapshot checkpoint error. "
+                        f"request={request_id}, group={gid}, boundary={boundary}, "
+                        f"{type(e).__name__}: {e}"
+                    )
+        if registered:
+            logger.info_once(
+                f"[stage-2] registered {registered} snapshot checkpoint(s)"
+            )
+
     def _build_dump_transfer_data(
         self,
         metadata: "UCMConnectorMetadata",
@@ -2150,6 +2325,20 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                     logger.error_limit(
                         f"wait for dump kv cache failed. " f"{type(e).__name__}: {e}"
                     )
+        # 阶段 2(4.3): dump 落盘确认后登记快照检查点 (组, 位置, 前缀哈希)。
+        # 仅登记"本步确实算到 LCM 边界"的状态位置(与 _generate_hla_dispatch_meta
+        # Pass-2 的 last_lcm_b 条件一致);重复登记幂等。
+        if dump_request_ids and self.group_manager is not None:
+            try:
+                metadata = self._get_connector_metadata()
+                assert isinstance(metadata, UCMConnectorMetadata)
+                self._register_snapshot_checkpoints_from_meta(metadata)
+            except Exception as e:
+                logger.error(
+                    "register snapshot checkpoints failed. %s: %s",
+                    type(e).__name__,
+                    e,
+                )
         self._rank_consistency.finish_dump(dump_request_ids)
         if self._layerwise_save_bytes > 0:
             ucmmetrics.update_stats({"save_bytes_total": self._layerwise_save_bytes})
