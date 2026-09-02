@@ -43,6 +43,7 @@ on_get_miss),不 import 协调器层,保持 store 层不依赖集成层。
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -72,6 +73,10 @@ class SnapshotStore:
 
     同一位置不同前缀、同一前缀不同位置都是不同条目。"位置"是检查点网格刻度
     (token 序号),"前缀哈希"隔离跨前缀内容(位置对、内容错不会命中,4.3)。
+
+    ``root_dir`` 给定时启用**字节持久化**(9.1 阶段 2 "快照真正落盘"): Put/Donate
+    落盘(原子写: 先写 ``.tmp`` 再 rename),Get 内存 miss 时按需读回,淘汰时删盘上
+    文件。条目文件内容 = 裸字节(状态张量序列化由调用方负责,store 不碰模型语义)。
     """
 
     def __init__(
@@ -79,10 +84,60 @@ class SnapshotStore:
         group_name: str,
         *,
         max_entries: Optional[int] = None,
+        root_dir: Optional[os.PathLike] = None,
     ) -> None:
         self.group_name = group_name
         self.max_entries = max_entries
         self._entries: dict[tuple[int, bytes], SnapshotEntry] = {}
+        self.root_dir = os.fspath(root_dir) if root_dir is not None else None
+        if self.root_dir is not None:
+            os.makedirs(self.root_dir, exist_ok=True)
+
+    # -- 磁盘路径(持久化布局) ------------------------------------------------
+
+    @staticmethod
+    def _key_file_name(position: int, prefix_hash: bytes) -> str:
+        """条目文件名: 位置 + 前缀哈希(hex) 拼成单文件,位置变化即不同文件。
+
+        两级目录分片(首 2 hex)避免单目录文件过多;与 Posix 内容寻址布局
+        (分片目录 + 定长文件名)同构,见附录 E3。
+        """
+        ph = prefix_hash.hex()
+        return os.path.join(ph[:2], f"{position:x}-{ph}")
+
+    def _entry_path(self, position: int, prefix_hash: bytes) -> Optional[str]:
+        if self.root_dir is None:
+            return None
+        return os.path.join(self.root_dir, self._key_file_name(position, prefix_hash))
+
+    def _remove_file(self, position: int, prefix_hash: bytes) -> None:
+        path = self._entry_path(position, prefix_hash)
+        if path is None:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+    def _write_file(self, position: int, prefix_hash: bytes, payload: bytes) -> None:
+        path = self._entry_path(position, prefix_hash)
+        if path is None:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(payload)
+        os.replace(tmp, path)  # 原子提交,读方永远看不到半截文件
+
+    def _read_file(self, position: int, prefix_hash: bytes) -> Optional[bytes]:
+        path = self._entry_path(position, prefix_hash)
+        if path is None:
+            return None
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -105,6 +160,7 @@ class SnapshotStore:
         if key in self._entries:
             return False
         self._entries[key] = SnapshotEntry(payload=bytearray(payload), heat=1)
+        self._write_file(position, prefix_hash, payload)
         self._evict_if_over_capacity()
         return True
 
@@ -112,10 +168,15 @@ class SnapshotStore:
         """Get(=CoW): 命中则返回**副本**并累加热度;未命中返回 None。
 
         取用前复制防污染(5.1 / 7.6 R4): 调用方随意改返回值,不影响存储内条目。
+        内存 miss 时按需读盘(惰性恢复): 盘上也没有才是真 miss。
         """
         entry = self._entries.get((position, prefix_hash))
         if entry is None:
-            return None
+            disk_payload = self._read_file(position, prefix_hash)
+            if disk_payload is None:
+                return None
+            entry = SnapshotEntry(payload=bytearray(disk_payload), heat=0)
+            self._entries[(position, prefix_hash)] = entry
         entry.heat += 1
         return bytes(entry.payload)
 
@@ -128,6 +189,7 @@ class SnapshotStore:
         if key in self._entries:
             return False
         self._entries[key] = SnapshotEntry(payload=payload, heat=0, owner=True)
+        self._write_file(position, prefix_hash, bytes(payload))
         self._evict_if_over_capacity()
         return True
 
@@ -157,16 +219,32 @@ class SnapshotStore:
         """位置价值淘汰(开放项,附录 E9 方向): 逐出热度最低条目。
 
         返回被逐出的键,调用方(协调器)据此对检查点目录做 ``on_get_miss``。
+        持久化条目同时删除盘上文件(下次 Get miss -> 目录项自然作废,4.3)。
         """
         evicted: list[tuple[int, bytes]] = []
         for pos, ph, _heat in self.heat_rank()[:limit]:
             self._entries.pop((pos, ph), None)
+            self._remove_file(pos, ph)
             evicted.append((pos, ph))
         return evicted
 
     def _evict_if_over_capacity(self) -> None:
         if self.max_entries is not None and len(self._entries) > self.max_entries:
             self.evict_lowest_heat(len(self._entries) - self.max_entries)
+
+    def snapshot_files(self) -> list[str]:
+        """盘上已落盘条目文件(相对 root_dir;无持久化时为空列表)。"""
+        if self.root_dir is None or not os.path.isdir(self.root_dir):
+            return []
+        names: list[str] = []
+        for shard in os.listdir(self.root_dir):
+            shard_dir = os.path.join(self.root_dir, shard)
+            if not os.path.isdir(shard_dir):
+                continue
+            for name in os.listdir(shard_dir):
+                if not name.endswith(".tmp"):
+                    names.append(f"{shard}/{name}")
+        return sorted(names)
 
 
 class SnapshotGroup:

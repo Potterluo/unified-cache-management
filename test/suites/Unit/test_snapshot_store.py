@@ -115,6 +115,56 @@ class SnapshotStoreTest(unittest.TestCase):
         self.assertEqual(len(s), 2)
         self.assertIsNotNone(s.get(3, b"p"))
 
+    def test_disk_persistence_put_get_across_instances(self):
+        # 9.1 阶段 2 字节落盘: Put 落盘 -> 新实例从磁盘惰性读回 -> CoW 语义不变。
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s1 = SnapshotStore("mamba2", root_dir=tmp)
+            self.assertTrue(s1.put(3072, b"prefix", b"\x00\x01state-bytes"))
+            self.assertTrue(s1.put(4096, b"prefix", b"\x02\x03other"))
+            # 原子写: 无 .tmp 残留,两个条目各一个文件。
+            files = s1.snapshot_files()
+            self.assertEqual(len(files), 2)
+            self.assertFalse(any(f.endswith(".tmp") for f in files))
+
+            # 新实例(空内存)按需读盘。
+            s2 = SnapshotStore("mamba2", root_dir=tmp)
+            self.assertEqual(len(s2), 0)
+            self.assertEqual(s2.get(3072, b"prefix"), b"\x00\x01state-bytes")
+            self.assertEqual(s2.get(4096, b"prefix"), b"\x02\x03other")
+            self.assertEqual(len(s2), 2)
+
+            # CoW: 修改返回值不影响存储内条目(读回后仍有原值)。
+            got = s2.get(3072, b"prefix")
+            self.assertIsNotNone(got)
+            mutated = bytearray(got)
+            mutated[0] = 0xFF
+            self.assertEqual(s2.get(3072, b"prefix"), b"\x00\x01state-bytes")
+
+            # 位置键语义持久化不变: 位置差一个 token 即不同条目。
+            self.assertIsNone(s2.get(3073, b"prefix"))
+            self.assertIsNone(s2.get(3072, b"other-prefix"))
+
+    def test_disk_eviction_removes_file_and_auto_invalidates(self):
+        # 淘汰 = 内存条目 + 盘上文件一起删;新实例读回 miss -> 目录项作废(4.3)。
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s = SnapshotStore("mamba2", root_dir=tmp)
+            s.put(1024, b"p", b"a")
+            s.put(2048, b"p", b"b")
+            s.touch()
+            s.get(2048, b"p")  # 2048 更热
+
+            evicted = s.evict_lowest_heat(1)
+            self.assertEqual(evicted, [(1024, b"p")])
+            self.assertEqual(len(s.snapshot_files()), 1)  # 盘上同步删除
+
+            s2 = SnapshotStore("mamba2", root_dir=tmp)
+            self.assertIsNone(s2.get(1024, b"p"))  # 读盘 miss
+            self.assertEqual(s2.get(2048, b"p"), b"b")  # 未淘汰条目可读回
+
 
 class SnapshotGroupTest(unittest.TestCase):
     """4.3 惰性失效 + 算例 C 风格的目录联动。"""
