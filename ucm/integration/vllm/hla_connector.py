@@ -364,17 +364,21 @@ class KVCacheGroupManager:
         new_l, _ = resolve_hit(spec, {}, existence_by_chain, checkpoints)
 
         # 旧逻辑的链式候选只来自 full-attn 组(与规格表 chain 行同集)。
-        legacy_chain_l = num_computed_tokens
-        for fa in self.full_attn_groups:
-            bs = fa.block_size
-            external = group_block_ids[fa.group_id][num_computed_tokens // bs :]
-            if not external:
-                abs_exists = num_computed_tokens
-            else:
-                hit_blocks = lookup_on_prefix(external) + 1
-                abs_exists = num_computed_tokens + max(hit_blocks, 0) * bs
-            legacy_chain_l = min(legacy_chain_l, abs_exists)
-        legacy_chain_l = (legacy_chain_l // self.lcm_block_size) * self.lcm_block_size
+        # 统一走 spec_table_builder.legacy_chain_candidate_l 纯函数,与单测
+        # 共用同一基准(内联复算曾因初值 = num_computed_tokens 导致 min 恒等
+        # 于初值,记账永远为 0,见 4.4 C1 记账失真)。
+        from ucm.integration.vllm.spec_table_builder import (
+            legacy_chain_candidate_l,
+        )
+
+        legacy_chain_l = legacy_chain_candidate_l(
+            num_computed_tokens,
+            [fa.group_id for fa in self.full_attn_groups],
+            group_block_ids,
+            lookup_on_prefix,
+            [fa.block_size for fa in self.full_attn_groups],
+            self.lcm_block_size,
+        )
 
         if new_l != legacy_chain_l:
             logger.warning(

@@ -153,6 +153,30 @@ class BuildSpecTableTest(unittest.TestCase):
         # LCM 只统计链式组(mamba 快照组的 64 不参与对齐,4.2)。
         self.assertEqual(spec.lcm_block_size, 128)
 
+    def test_ascend_c4_compress_block_size_token_scale(self):
+        # DSV4 C4 压缩组: 引擎 spec.block_size=32(storage 刻度) + compress_ratio=4
+        # -> 规格表 block 应为 32*4=128(逻辑 token 刻度,与 FAWA 旧表
+        # token_block_size 对齐,4.1/6.2/4.4 C1)。
+        class AscendC4Spec(fake_vllm.FullAttentionSpec):
+            def __init__(self, block_size, compress_ratio=1):
+                super().__init__(block_size)
+                self.compress_ratio = compress_ratio
+
+        groups = [_group(AscendC4Spec(32, compress_ratio=4), ("m0",))]
+        spec = spec_table_builder.build_spec_table(groups)
+        self.assertEqual(spec.rows[0].kind, CacheKind.CHAIN)
+        self.assertEqual(spec.rows[0].block_size, 128)
+        self.assertEqual(spec.lcm_block_size, 128)
+        # FAWA 旧表 KVCacheGroupMeta.token_block_size = 128 -> 双跑无 block 告警。
+        legacy = [SimpleNamespace(group_id=0, token_block_size=128)]
+        self.assertEqual(spec_table_builder.double_run_ledger(spec, legacy), [])
+
+    def test_non_compress_group_unchanged(self):
+        # 无 compress_ratio 的组: block 保持引擎原始值(不缩放)。
+        groups = [_group(fake_vllm.FullAttentionSpec(128), ("m0",))]
+        spec = spec_table_builder.build_spec_table(groups)
+        self.assertEqual(spec.rows[0].block_size, 128)
+
     def test_uniform_type_spec_recursion(self):
         # 混合 UniformType 组(MLA + mamba): 只要含 mamba(align) 层即为快照组。
         uni = fake_vllm.UniformTypeKVCacheSpecs(
@@ -258,6 +282,225 @@ class DoubleRunFlagTest(unittest.TestCase):
             self.assertTrue(spec_table_builder.spec_table_double_run_enabled())
         finally:
             del os.environ["UCM_SPEC_TABLE_DOUBLE_RUN"]
+
+
+class LegacyChainCandidateTest(unittest.TestCase):
+    """4.4 C1 记账基准: legacy_chain_candidate_l 纯函数与旧 Stage-1 数学一致。
+
+    回归点: hla_connector._double_run_shadow_resolve 曾把 legacy 链式候选的
+    初值设成 num_computed_tokens,导致 min 恒等于初值、记账永远为 0
+    (真实模型日志: resolve_hit l=3072 != legacy chain l=0)。抽成纯函数后,
+    此处用与 4.5 算例 A 同构的数字直接断言。
+    """
+
+    @staticmethod
+    def _lookup_present(block_ids, present: set[int]) -> int:
+        """模拟 store.lookup_on_prefix: 返回最后一个连续存在块的下标,无则 -1。"""
+        last = -1
+        for i, bid in enumerate(block_ids):
+            if bid not in present:
+                break
+            last = i
+        return last
+
+    def _block_ids(self, n: int) -> list[bytes]:
+        return [bytes([i]) for i in range(n)]
+
+    def test_example_A_numbers(self):
+        # 与 4.5 算例 A 同构: mla(128x36 块存在) / csa(128x35 块存在) / swa(全在)。
+        group_block_ids = [
+            self._block_ids(64),  # group 0 = mla
+            self._block_ids(64),  # group 1 = csa
+            self._block_ids(64),  # group 2 = swa
+        ]
+        present_mla = {bytes([i]) for i in range(36)}
+        present_csa = {bytes([i]) for i in range(35)}
+        present_swa = {bytes([i]) for i in range(64)}
+
+        def make_lookup(present):
+            return lambda ids: LegacyChainCandidateTest._lookup_present(ids, present)
+
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0, 1, 2],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=make_lookup(present_mla),
+            block_sizes=[128, 128, 128],
+            lcm_block_size=128,
+        )
+        # 只用一个组: mla 36 块 -> 4608,floor 128 -> 4608。
+        self.assertEqual(l, 4608)
+
+        # 三组 min: mla=4608, csa=4480, swa=8192 -> min=4480,对齐 128。
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0, 1, 2],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lambda ids: min(
+                make_lookup(present_mla)(ids),
+                make_lookup(present_csa)(ids),
+                make_lookup(present_swa)(ids),
+            ),
+            block_sizes=[128, 128, 128],
+            lcm_block_size=128,
+        )
+        self.assertEqual(l, 4480)
+
+    def test_regression_3072_not_stuck_at_zero(self):
+        # Qwen3.8 形态: 单 full-attn 组 block=1536,两块都在 -> 2*1536=3072;
+        # 旧记账曾因 min 初值 bug 恒为 0。抽成纯函数后必须返回 3072。
+        group_block_ids = [self._block_ids(8)]
+        lookup = lambda ids: self._lookup_present(ids, {bytes([0]), bytes([1])})
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lookup,
+            block_sizes=[1536],
+            lcm_block_size=1536,
+        )
+        self.assertEqual(l, 3072)
+
+    def test_miss_returns_zero(self):
+        group_block_ids = [self._block_ids(8)]
+        lookup = lambda ids: self._lookup_present(ids, set())  # 全 miss
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lookup,
+            block_sizes=[1536],
+            lcm_block_size=1536,
+        )
+        self.assertEqual(l, 0)
+
+    def test_num_computed_offset(self):
+        # num_computed_tokens 不为 0 时,候选长度是绝对位置(旧逻辑的
+        # external_hit_tokens 相对值 + num_computed)。
+        # num_computed=1536 -> fa_hbm_blocks=1,external 从第 2 块开始;
+        # store 里第 2 块存在 -> hit_blocks=1 -> 相对 1536 -> 绝对 3072。
+        group_block_ids = [self._block_ids(16)]
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=1536,
+            full_attn_group_ids=[0],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lambda ids: self._lookup_present(ids, {bytes([1])}),
+            block_sizes=[1536],
+            lcm_block_size=1536,
+        )
+        self.assertEqual(l, 3072)
+
+    def test_min_over_groups_and_floor_lcm(self):
+        # 多组不同 block_size: min 后向下对齐 LCM(4.2)。
+        group_block_ids = [
+            self._block_ids(16),
+            self._block_ids(16),
+        ]
+        l = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0, 1],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lambda ids: self._lookup_present(
+                ids, {bytes([0]), bytes([1]), bytes([2])}
+            ),
+            block_sizes=[128, 64],
+            lcm_block_size=128,
+        )
+        # g0 3 块(128) -> 384;g1 3 块(64) -> 192;min=192,floor LCM=128。
+        self.assertEqual(l, 128)
+
+
+class ResolveVsLegacyEquivalenceTest(unittest.TestCase):
+    """4.4 C1 核心: resolve_hit(新) 与 legacy 链式候选(旧) 数字等价。
+
+    Shadow resolve 的 existence_by_chain 必须与 legacy_chain_candidate_l 对
+    同一份 lookup 结果给出同一长度;不等价即双跑记账失真,冻结切新(4.4 C1)。
+    """
+
+    def _chain_spec(self):
+        return kv_spec_table.SpecTable(
+            [
+                kv_spec_table.SpecRow("fa0", CacheKind.CHAIN, 128),
+                kv_spec_table.SpecRow("fa1", CacheKind.CHAIN, 64),
+            ]
+        )
+
+    def test_equivalent_on_shared_lookup(self):
+        spec = self._chain_spec()
+        row_to_gid = {"fa0": 0, "fa1": 1}
+        group_block_ids = [[bytes([i]) for i in range(16)]] * 2
+
+        def present_gid0(ids):
+            last = -1
+            for i, bid in enumerate(ids):
+                if i >= 3:
+                    break
+                last = i
+            return last
+
+        def present_gid1(ids):
+            last = -1
+            for i, bid in enumerate(ids):
+                if i >= 2:
+                    break
+                last = i
+            return last
+
+        lookup = {0: present_gid0, 1: present_gid1}
+
+        def existence_by_chain(row, block_ids):
+            gi = row_to_gid[row.group_name]
+            bs = row.block_size
+            external = group_block_ids[gi][0 // bs :]
+            if not external:
+                return 0
+            hit_blocks = lookup[gi](external) + 1
+            return 0 + max(hit_blocks, 0) * bs
+
+        l_new, _ = kv_spec_table.resolve_hit(
+            spec, {}, existence_by_chain, {}
+        )
+        l_legacy = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0, 1],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lambda ids: lookup[0](ids),
+            block_sizes=[128, 64],
+            lcm_block_size=128,
+        )
+        # g0 命中 3 块 -> 384;g1 命中 2 块 -> 128;min=128,floor LCM=128。
+        self.assertEqual(l_new, l_legacy)
+        self.assertEqual(l_new, 128)
+
+    def test_equivalent_miss_side(self):
+        spec = self._chain_spec()
+        row_to_gid = {"fa0": 0, "fa1": 1}
+        group_block_ids = [[bytes([i]) for i in range(16)]] * 2
+        lookup = {
+            0: lambda ids: -1,
+            1: lambda ids: -1,
+        }
+
+        def existence_by_chain(row, block_ids):
+            gi = row_to_gid[row.group_name]
+            bs = row.block_size
+            external = group_block_ids[gi][0 // bs :]
+            if not external:
+                return 0
+            hit_blocks = lookup[gi](external) + 1
+            return 0 + max(hit_blocks, 0) * bs
+
+        l_new, _ = kv_spec_table.resolve_hit(spec, {}, existence_by_chain, {})
+        l_legacy = spec_table_builder.legacy_chain_candidate_l(
+            num_computed_tokens=0,
+            full_attn_group_ids=[0, 1],
+            group_block_ids=group_block_ids,
+            lookup_on_prefix=lambda ids: -1,
+            block_sizes=[128, 64],
+            lcm_block_size=128,
+        )
+        self.assertEqual(l_new, l_legacy)
+        self.assertEqual(l_new, 0)
 
 
 if __name__ == "__main__":

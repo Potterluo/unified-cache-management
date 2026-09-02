@@ -38,8 +38,9 @@ KVCacheGroupMeta``),实现本报告的规格表时要先在**不改变旧逻辑*
 与零依赖的 ``kv_spec_table.py`` 保持模块边界。
 """
 
+import math
 import os
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -74,6 +75,29 @@ def block_size_from_spec(spec: KVCacheSpec) -> Optional[int]:
             return s.block_size
         return None
     return spec.block_size
+
+
+def compress_ratio_from_spec(spec: KVCacheSpec) -> int:
+    """压缩比: 统一规格取首个成员 spec,普通 spec 取 ``compress_ratio``(缺省 1)。"""
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        for s in spec.kv_cache_specs.values():
+            return compress_ratio_from_spec(s)
+        return 1
+    return int(getattr(spec, "compress_ratio", 1) or 1)
+
+
+def logical_block_size_from_spec(spec: KVCacheSpec) -> Optional[int]:
+    """规格表 block 列的语义(4.1): 一个缓存块装多少个 **token**。
+
+    Ascend 压缩组(如 DS-V4 的 C4/C128)的引擎 ``spec.block_size`` 是存储刻度
+    (``storage_block_size = block_size // compress_ratio``,见 6.2),而 FAWA
+    旧表 ``token_block_size = block_size * compress_ratio`` 才是逻辑 token
+    刻度;规格表必须用逻辑刻度才能与旧逻辑对齐(4.4 C1 双跑记账)。
+    """
+    base = block_size_from_spec(spec)
+    if base is None:
+        return None
+    return base * compress_ratio_from_spec(spec)
 
 
 def is_mamba_align_spec(spec: KVCacheSpec) -> bool:
@@ -118,6 +142,49 @@ def spec_kind(spec: KVCacheSpec) -> CacheKind:
     return CacheKind.CHAIN
 
 
+def legacy_chain_candidate_l(
+    num_computed_tokens: int,
+    full_attn_group_ids: Sequence[int],
+    group_block_ids: Sequence[Sequence[bytes]],
+    lookup_on_prefix: Callable[[Sequence[bytes]], int],
+    block_sizes: Sequence[int],
+    lcm_block_size: int,
+) -> int:
+    """复算旧 HLA 逻辑的链式命中候选长度(4.4 C1 双跑记账的对照基准)。
+
+    与 ``hla_connector.KVCacheGroupManager`` 旧逻辑的 Stage-1(full-attn 组
+    lookup_on_prefix 取 min、向下对齐 LCM)做等价回归,是 ``resolve_hit`` 切新前
+    必须对齐的数字。纯函数、零依赖,供双跑记账与单测共用同一基准。
+
+    Returns:
+        旧逻辑的链式候选 ``l``(绝对 token 位置,已对齐 LCM,≤ 所有 full-attn
+        组的最长存在)。注意: 这是**链式候选**,不含快照状态检查(Stage-2 的
+        lookup_on_reverse 属快照语义,阶段 2 SnapshotStore 落地后单独回归)。
+    """
+    assert len(full_attn_group_ids) == len(block_sizes)
+    candidates: list[int] = []
+    for gid, block_size in zip(full_attn_group_ids, block_sizes):
+        fa_block_ids = group_block_ids[gid]
+        fa_hbm_blocks = num_computed_tokens // block_size
+        fa_external = fa_block_ids[fa_hbm_blocks:]
+        if not fa_external:
+            # 该组没有可查的外部块: 视为命中 = 0(不能算进候选)。
+            candidates.append(0)
+            continue
+        try:
+            fa_hit_blocks = lookup_on_prefix(fa_external) + 1
+        except Exception:
+            # 与旧逻辑一致: lookup 异常按 miss 处理,不升级为错命。
+            candidates.append(0)
+            continue
+        candidates.append(max(fa_hit_blocks, 0) * block_size)
+    min_external_hit_tokens = min(candidates)
+    external_hit_tokens = (
+        min_external_hit_tokens // lcm_block_size
+    ) * lcm_block_size
+    return num_computed_tokens + external_hit_tokens
+
+
 def build_spec_table(
     kv_cache_groups: Sequence,
     *,
@@ -132,7 +199,10 @@ def build_spec_table(
     for group_id, group in enumerate(kv_cache_groups):
         spec = group.kv_cache_spec
         kind = spec_kind(spec)
-        block_size = block_size_from_spec(spec)
+        # 块大小用逻辑 token 刻度(4.1: 一个缓存块装多少个 token):Ascend 压缩组
+        # 的引擎 spec.block_size 是 storage 刻度,须乘 compress_ratio 与 FAWA
+        # 旧表 token_block_size 对齐(6.2 / 4.4 C1)。
+        block_size = logical_block_size_from_spec(spec)
         rank_rule = RankRule.ALL_UNION if is_mla_spec(spec) else RankRule.ALL_INTERSECT
         retention = (
             RetentionPolicy(grid_alignment=block_size or 1)
