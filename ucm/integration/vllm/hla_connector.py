@@ -1506,6 +1506,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         state_idx = max((seq_len - 1) // group.block_size, 0)
         vllm_state_idx = state_idx
         if reason == "load":
+            # load 侧状态必须写到"引擎眼里的最后一块"(2.2: 运行中的状态总记在
+            # 最后一个块上)。resume 请求按完整序列分配块(如 3402 token -> 3 块
+            # [0,10,15]),引擎从续算点(如 3072)接着写时读的是**最后一块**
+            # (idx 2 = 块 15),不是 ``state_idx``(3072 所在块 idx 1)。
+            # dump 侧相反: dump 发生时序列只到 last_lcm_b(如 3072,共 2 块
+            # [3,6]),"最后一块"就是 idx 1 = ``state_idx`` -- dump 侧取
+            # ``state_idx`` 本就正确。两侧语义都是"序列最后一块",实现不同:
+            # dump 在短序列上取,load 在完整序列上取。
             block_ids = req_meta.group_vllm_block_ids[gid]
             for i in range(len(block_ids) - 1, -1, -1):
                 if block_ids[i] != 0:
@@ -1639,6 +1647,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 )
             dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
             # Pass 2: mamba state blocks
+            state_dump_start_len = len(dump_ucm_block_ids)
             for gid, group in enumerate(groups_by_id):
                 if not group.is_mamba_align:
                     continue
@@ -1653,19 +1662,24 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     last_lcm_b,
                     "dump",
                 )
+            # 本步 mamba 状态是否**实际加入 dump 计划**(Pass-2 真 append 了状态块)。
+            # 只有真正落盘的状态位置才能登记检查点(4.3);仅凭 KV 块存在就登记
+            # 会让目录谎报"3072 有状态" -> authoritative 深信 p*=3072 跳过计算
+            # -> 状态缺失 -> 错命(错误输出)。状态没落盘 = 目录不登记 = 读回 miss
+            # -> 完整重算(漏命安全,错命 > 漏命,铁律 3)。
+            state_dumped = len(dump_ucm_block_ids) > state_dump_start_len
         else:
             dump_full_attn_count = 0
+            state_dumped = False
 
         req_meta.token_processed += new_tokens
 
-        # 本步 mamba 状态是否实际落盘: Pass-2 在 dump_tok_end == last_lcm_b 且
-        # last_lcm_b >= first_lcm_b 时才 append 状态块(见上),即
-        # dump 列表超出 full-attn 块的部分非空。登记检查点只需 (位置, 前缀哈希),
-        # 主组块哈希链在本请求的 ``req_meta.group_ucm_block_ids`` 里,由
-        # ``checkpoint_prefix_hash`` 提取 -- 与 authoritative 查询侧同源(4.3 位置键)。
+        # 登记检查点只需 (位置, 前缀哈希),主组块哈希链在本请求的
+        # ``req_meta.group_ucm_block_ids`` 里,由 ``checkpoint_prefix_hash`` 提取
+        # -- 与 authoritative 查询侧同源(4.3 位置键)。
         last_lcm_b_carried = 0
         primary_prefix_hash = None
-        if len(dump_ucm_block_ids) > dump_full_attn_count and last_lcm_b > 0:
+        if state_dumped and last_lcm_b > 0:
             last_lcm_b_carried = last_lcm_b
             primary_prefix_hash = self.group_manager.checkpoint_prefix_hash(
                 last_lcm_b, req_meta.group_ucm_block_ids
@@ -2105,6 +2119,14 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         row_id: int,
         metadata: "UCMConnectorMetadata",
     ) -> None:
+        # 竞态修复(精度实测: 磁盘读回间歇错命,与全量输出不一致): 引擎的
+        # do_mamba_copy_block(compute stream,preprocess_mamba)与 UCM 的 load
+        # DMA(store stream)会写**同一个状态块**。start_load_kv 只在首个 row
+        # 提交前 synchronize 一次;后续 row 的 load(逐层推进/prefetch)缺乏同步,
+        # 导致 mamba copy 可能在 load DMA 之后落地覆盖已装载的状态 -> 状态错乱
+        # -> 静默错命(错误输出)。因此每次 row load DMA 提交前强制 synchronize,
+        # 建立 compute->store 全序。正确性优先(错命 > 漏命,铁律 3)。
+        self.device.synchronize()
         for (
             request_id,
             ucm_block_ids,
