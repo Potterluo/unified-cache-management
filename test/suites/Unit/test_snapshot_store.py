@@ -1,0 +1,175 @@
+#
+# MIT License
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+"""Stage-2 unit tests: SnapshotStore (5.1 位置键 / CoW / Donate / Touch) +
+SnapshotGroup 惰性失效(4.3),断言口径与 9.1 阶段 2 一致。
+
+与 test_kv_spec_table 相同的零依赖加载方式(importlib 直接加载模块文件)。
+"""
+
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SNAPSHOT_PATH = REPO_ROOT / "ucm" / "store" / "snapshot_store.py"
+KVS_PATH = REPO_ROOT / "ucm" / "integration" / "vllm" / "kv_spec_table.py"
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+snapshot_store = _load_module("snapshot_store", SNAPSHOT_PATH)
+kv_spec_table = _load_module("kv_spec_table", KVS_PATH)
+
+SnapshotStore = snapshot_store.SnapshotStore
+SnapshotGroup = snapshot_store.SnapshotGroup
+CheckpointDirectory = kv_spec_table.CheckpointDirectory
+NO_BOUNDARY = snapshot_store.NO_BOUNDARY
+
+
+class SnapshotStoreTest(unittest.TestCase):
+    """5.1: 位置键 / CoW / Donate / Touch / 位置价值淘汰。"""
+
+    def test_position_key_semantics(self):
+        # "罐头": 位置不对就废;同一位置不同前缀互不可见。
+        s = SnapshotStore("mamba2")
+        self.assertTrue(s.put(4096, b"prefix-A", b"state-a"))
+        self.assertEqual(s.get(4096, b"prefix-A"), b"state-a")
+        self.assertIsNone(s.get(4096, b"prefix-B"))  # 前缀不对
+        self.assertIsNone(s.get(4032, b"prefix-A"))  # 位置不对
+
+    def test_put_first_commit_wins(self):
+        s = SnapshotStore("mamba2")
+        self.assertTrue(s.put(4096, b"p", b"first"))
+        self.assertFalse(s.put(4096, b"p", b"second"))
+        self.assertEqual(s.get(4096, b"p"), b"first")
+
+    def test_get_is_cow(self):
+        s = SnapshotStore("mamba2")
+        s.put(4096, b"p", b"hello-kv")
+        got = s.get(4096, b"p")
+        assert got is not None
+        mutated = bytearray(got)
+        mutated[0] = ord("X")
+        self.assertEqual(s.get(4096, b"p"), b"hello-kv")  # 存储不受影响
+        self.assertNotEqual(bytes(mutated), s.get(4096, b"p"))
+
+    def test_donate_zero_copy_takeover(self):
+        s = SnapshotStore("mamba2")
+        buf = bytearray(b"donated-state")
+        self.assertTrue(s.donate(2048, b"p", buf))
+        # 零拷贝: store 直接持有同一缓冲对象(不做拷贝)。
+        entry = s._entries[(2048, b"p")]
+        self.assertIs(entry.payload, buf)
+        # Get 仍返回副本,防调用方在共享态上改写。
+        got = s.get(2048, b"p")
+        self.assertIsNot(got, buf)
+        self.assertEqual(got, b"donated-state")
+
+    def test_touch_and_evict_lowest_heat(self):
+        s = SnapshotStore("mamba2")
+        s.put(1024, b"p", b"a")
+        s.put(2048, b"p", b"b")
+        s.put(3072, b"p", b"c")
+        s.touch()  # 全组脉冲
+        s.touch(prefix_hash=b"p")
+        s.get(2048, b"p")  # 2048 再热一点
+        evicted = s.evict_lowest_heat(1)
+        self.assertEqual(evicted, [(1024, b"p")])
+        self.assertIsNone(s.get(1024, b"p"))
+        self.assertIsNotNone(s.get(3072, b"p"))
+
+    def test_max_entries_capacity_eviction(self):
+        s = SnapshotStore("kda", max_entries=2)
+        s.put(1, b"p", b"x1")
+        s.put(2, b"p", b"x2")
+        s.put(3, b"p", b"x3")  # 超出容量 -> 逐出热度最低
+        self.assertEqual(len(s), 2)
+        self.assertIsNotNone(s.get(3, b"p"))
+
+
+class SnapshotGroupTest(unittest.TestCase):
+    """4.3 惰性失效 + 算例 C 风格的目录联动。"""
+
+    def _group(self, grid=64):
+        directory = CheckpointDirectory("mamba2", grid_alignment=grid)
+        return SnapshotGroup("mamba2", directory, grid_alignment=grid), directory
+
+    def test_get_best_deepest_within_l(self):
+        group, _dir = self._group()
+        group.put_at_position(b"p", 4096, b"state-4096")
+        group.put_at_position(b"p", 4608, b"state-4608")
+        # l=4480: 4608 够不着,取最深的 4096。
+        self.assertEqual(group.get_best(4480, b"p"), b"state-4096")
+        self.assertEqual(group.get_best(5000, b"p"), b"state-4608")
+
+    def test_lazy_invalidation_when_chain_shrinks(self):
+        group, directory = self._group()
+        group.put_at_position(b"p", 4096, b"state")
+        self.assertEqual(group.get_best(4096, b"p"), b"state")
+        # 链式块被淘汰到只剩 3072: 检查点自动够不着 -> None(零通知零跨层)。
+        self.assertIsNone(group.get_best(3072, b"p"))
+        self.assertEqual(directory.deepest_candidate(3072, b"p"), NO_BOUNDARY)
+
+    def test_evicted_entry_auto_invalidates_directory(self):
+        group, directory = self._group()
+        group.put_at_position(b"p", 4096, b"state")
+        self.assertEqual(directory.positions(b"p"), {4096})
+        group.evict(limit=1)
+        # 目录项已作废;深位置也取不到(条目没了)。
+        self.assertEqual(directory.positions(b"p"), set())
+        self.assertIsNone(group.get_best(9999, b"p"))
+
+    def test_cross_prefix_isolation(self):
+        group, directory = self._group()
+        group.put_at_position(b"A", 4096, b"state-A")
+        group.put_at_position(b"B", 4096, b"state-B")
+        self.assertEqual(group.get_best(4096, b"A"), b"state-A")
+        self.assertEqual(group.get_best(4096, b"B"), b"state-B")
+        self.assertEqual(directory.positions(b"A"), {4096})
+
+    def test_example_C_style_request_end_growth(self):
+        # 10000 token 输入,定间隔 1024: 请求1 完整跑完登记到 10000;
+        # 请求3 只到 5000 -> 从最深检查点 4096 续算(p* 语义),请求结束补 {5000}。
+        group, directory = self._group(grid=1)
+        prefix = b"same-prefix"
+        end1 = 10000
+        for pos in list(range(1024, end1 + 1, 1024)) + [end1]:
+            group.put_at_position(prefix, pos, b"state@%d" % pos)
+        self.assertEqual(group.get_best(end1, prefix), b"state@10000")
+        # 请求3: 链式命中到 5000,但检查点 @5000 缺失 -> p* = 4096。
+        self.assertEqual(group.get_best(5000, prefix), b"state@4096")
+        group.put_at_position(prefix, 5000, b"state@5000")
+        self.assertIn(5000, directory.positions(prefix))
+
+
+if __name__ == "__main__":
+    unittest.main()
