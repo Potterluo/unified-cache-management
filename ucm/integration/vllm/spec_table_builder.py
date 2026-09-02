@@ -162,15 +162,20 @@ def double_run_ledger(
     spec: SpecTable,
     legacy_groups: Iterable,
 ) -> list[str]:
-    """双跑记账: 逐组比对旧 ``GroupInfo`` 与规格表,返回不一致描述清单。
+    """双跑记账: 逐组比对旧组信息与规格表,返回不一致描述清单。
 
     旧逻辑为准 -- 本函数只读比对,不产生任何行为变更;调用方负责对非空清单
-    告警(``logger.warning``)并记录指标。比对维度:
+    告警(``logger.warning``)并记录指标。兼容两份旧的胚胎表(4.4 C1 / 9.1 动手点①):
+
+    - ``hla_connector.GroupInfo``(字段 block_size / is_mamba_align / layer_names);
+    - ``hma_connector.KVCacheGroupMeta``(字段 token_block_size,无 mamba 标记)。
+
+    比对维度:
 
     - 组数量一致;
-    - 每组的 block_size 一致(4.4 C1);
-    - kind 一致(mamba-align 与 ``SNAPSHOT`` 对应);
-    - 层数一致(层的归属是目录键的一部分)。
+    - 每组的 block 大小一致(GroupInfo.block_size / KVCacheGroupMeta.token_block_size);
+    - kind 一致(仅当旧表声明了 ``is_mamba_align`` 字段时比对;Fast 表不表达
+      快照语义,跳过该项以免误报)。
     """
     mismatches: list[str] = []
     legacy = list(legacy_groups)
@@ -187,13 +192,18 @@ def double_run_ledger(
             continue
         row = spec.rows[group_id]
         legacy_bs = getattr(info, "block_size", None)
-        if legacy_bs != row.block_size:
+        if legacy_bs is None:
+            # hma_connector.KVCacheGroupMeta 用 token_block_size 表达块大小。
+            legacy_bs = getattr(info, "token_block_size", None)
+        if legacy_bs is not None and legacy_bs != row.block_size:
             mismatches.append(
                 f"group[{group_id}] block_size: legacy={legacy_bs} vs "
                 f"spec_table={row.block_size}"
             )
-        legacy_mamba = getattr(info, "is_mamba_align", False)
-        if legacy_mamba != (row.kind is CacheKind.SNAPSHOT):
+        legacy_mamba = getattr(info, "is_mamba_align", None)
+        if legacy_mamba is not None and legacy_mamba != (
+            row.kind is CacheKind.SNAPSHOT
+        ):
             mismatches.append(
                 f"group[{group_id}] kind: legacy.is_mamba_align={legacy_mamba} vs "
                 f"spec_table={row.kind.value}"

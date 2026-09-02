@@ -227,6 +227,28 @@ class DoubleRunLedgerTest(unittest.TestCase):
         msgs = spec_table_builder.double_run_ledger(spec, extra)
         self.assertTrue(any("组数量不一致" in m for m in msgs))
 
+    def test_fawa_kv_cache_group_meta_aligned(self):
+        # hma_connector.KVCacheGroupMeta: 字段是 token_block_size,无 is_mamba_align。
+        groups = [
+            _group(fake_vllm.FullAttentionSpec(256), ("m0",)),
+            _group(fake_vllm.FullAttentionSpec(64), ("m1",)),
+        ]
+        spec = spec_table_builder.build_spec_table(groups)
+        legacy = [
+            SimpleNamespace(group_id=0, token_block_size=256),
+            SimpleNamespace(group_id=1, token_block_size=64),
+        ]
+        # 不改写旧表语义: 块大小比对通过,kind 比对在缺少 is_mamba_align 时跳过。
+        self.assertEqual(spec_table_builder.double_run_ledger(spec, legacy), [])
+
+    def test_fawa_kv_cache_group_meta_block_size_mismatch(self):
+        groups = [_group(fake_vllm.FullAttentionSpec(256))]
+        spec = spec_table_builder.build_spec_table(groups)
+        legacy = [SimpleNamespace(group_id=0, token_block_size=128)]
+        msgs = spec_table_builder.double_run_ledger(spec, legacy)
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(any("block_size" in m for m in msgs))
+
 
 class DoubleRunFlagTest(unittest.TestCase):
     def test_flag_parsing(self):

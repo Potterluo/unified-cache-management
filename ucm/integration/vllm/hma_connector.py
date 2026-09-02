@@ -15,9 +15,11 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.spec_table_builder import spec_table_double_run_enabled
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
     _check_shm_capacity,
+    _record_counter,
     _use_ucm_connector_cpu_affinity,
 )
 from ucm.logger import init_logger
@@ -378,6 +380,30 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"is_ascend_layout={self.is_ascend_layout}, "
             f"group_metas={group_meta_summary}"
         )
+
+        # 双跑记账(4.4 C1 / 9.1 动手点①): 在 FAWA 侧也把胚胎表 KVCacheGroupMeta
+        # 与规格表逐组比对;旧逻辑为准,本块零行为变更,不一致仅告警+记指标。
+        self._spec_table_double_run = None
+        if role == KVConnectorRole.SCHEDULER and spec_table_double_run_enabled():
+            from ucm.integration.vllm.spec_table_builder import (
+                build_spec_table,
+                double_run_ledger,
+            )
+
+            self._spec_table_double_run = build_spec_table(
+                self._kv_cache_config.kv_cache_groups
+            )
+            logger.info(
+                "[double-run] FAWA spec table:\n%s",
+                repr(self._spec_table_double_run),
+            )
+            for msg in double_run_ledger(
+                self._spec_table_double_run,
+                [self.group_metas[i] for i in sorted(self.group_metas)],
+            ):
+                logger.warning("[double-run] %s", msg)
+                _record_counter("coordinator_spec_table_mismatches_total")
+
         logger.info("Init UCM FAWA connector.")
 
     def get_block_size(self) -> int:
@@ -810,7 +836,9 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             group_label = (
                 "FA"
                 if group_ids == self.fa_group_ids
-                else "WA" if group_ids == self.window_group_ids else str(group_ids)
+                else "WA"
+                if group_ids == self.window_group_ids
+                else str(group_ids)
             )
             raise RuntimeError(f"Worker FAWA {group_label} layout is empty.")
         return tensor_size_list
