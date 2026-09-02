@@ -496,17 +496,14 @@ class KVCacheGroupManager:
 
         # 快照 p* 主裁决: 检查点目录(惰性失效)。p* 之后的状态重推由引擎按
         # (l, p*) 分段执行;这里把 external hit 收窄到目录确认的 p*。
-        if self.group_manager is not None and not self.group_manager.state_groups:
+        # 本方法在 KVCacheGroupManager 类内部,直接用 self 的快照组与目录。
+        if not self.state_groups:
             # 无快照组: p* = 链式候选,目录不参与。
             return legacy_result
 
         total_hit_tokens = num_computed_tokens + legacy_external_hit_tokens
-        dir_p_star = (
-            self.group_manager.snapshot_p_star_from_directory(
-                num_computed_tokens, total_hit_tokens, group_block_ids
-            )
-            if self.group_manager is not None
-            else total_hit_tokens
+        dir_p_star = self.snapshot_p_star_from_directory(
+            num_computed_tokens, total_hit_tokens, group_block_ids
         )
         dir_external_hit_tokens = max(dir_p_star - num_computed_tokens, 0)
 
