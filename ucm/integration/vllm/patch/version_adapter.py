@@ -82,10 +82,13 @@ class VersionAdapter:
         """
         missing: list[str] = []
         base = base_dir or os.path.dirname(os.path.abspath(__file__))
-        version_dir = "v" + self.vllm_version.replace(".", "")
+        # 版本目录两种命名: v0XYZ(注入实现)与 x.y.z(历史 git 补丁档案)。
+        version_dirs = ("v" + self.vllm_version.replace(".", ""), self.vllm_version)
         for name in self.required_engine_patches:
-            path = os.path.join(base, version_dir, name)
-            if not os.path.isfile(path):
+            found = any(
+                os.path.isfile(os.path.join(base, vd, name)) for vd in version_dirs
+            )
+            if not found:
                 missing.append(name)
         return missing
 
@@ -99,6 +102,8 @@ def discover_adapters(
     延迟 import 各适配器模块(仅加载声明头),不触发引擎注入。
     ``directories``: 扫描目录(默认本模块所在目录),单测可注入临时目录;
     适配器模块经标准 import 解析(测试可预置 fake 包命名空间)。
+    ``ALIASES`` 模块常量: 附加版本别名(如 0.17.0 复用 v0180 适配器),
+    查表时别名与主键同查。
     """
     base_package = package or __name__.rsplit(".", 1)[0]
     search_dirs = (
@@ -123,7 +128,7 @@ def discover_adapters(
             apply_fn = getattr(mod, "apply", None)
             if not vllm_version or not callable(apply_fn):
                 continue
-            adapters[vllm_version] = VersionAdapter(
+            adapter = VersionAdapter(
                 vllm_version=vllm_version,
                 apply=apply_fn,
                 ascend_versions=tuple(getattr(mod, "ASCEND_VERSIONS", ())),
@@ -132,6 +137,9 @@ def discover_adapters(
                 ),
                 module_path=adapter_module_name,
             )
+            adapters[vllm_version] = adapter
+            for alias in getattr(mod, "ALIASES", ()):
+                adapters[alias] = adapter
     return adapters
 
 

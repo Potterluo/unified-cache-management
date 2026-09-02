@@ -150,5 +150,36 @@ class VersionAdapterRegistryTest(unittest.TestCase):
         )
 
 
+    def test_alias_version_resolves_to_same_adapter(self):
+        # v0180 适配器声明 ALIASES=("0.17.0",): 0.17.0 与 0.18.0 同适配器。
+        mod = _fake_adapter_module("0.18.0", ascend_versions=("0.18.0", "0.17.0"))
+        mod.ALIASES = ("0.17.0",)
+        self._install_adapter("v0180", mod)
+        table = version_adapter.discover_adapters(
+            package=self._fake_pkg, directories=[self._dir]
+        )
+        a18 = version_adapter.get_adapter("0.18.0", table)
+        a17 = version_adapter.get_adapter("0.17.0", table)
+        self.assertIsNotNone(a18)
+        self.assertIs(a17, a18)
+
+    def test_all_version_adapters_discoverable(self):
+        # 迁移清单完整性: 预置全部 11 个版本目录(fake),每个都应有适配器。
+        versions = (
+            ("v0251", "0.25.1"), ("v0240", "0.24.0"), ("v0230", "0.23.0"),
+            ("v0221", "0.22.1"), ("v0210", "0.21.0"), ("v0202", "0.20.2"),
+            ("v0191", "0.19.1"), ("v0180", "0.18.0"), ("v0110", "0.11.0"),
+            ("v0270", "0.27.0"), ("v0260", "0.26.0"),
+        )
+        for vd, ver in versions:
+            self._install_adapter(vd, _fake_adapter_module(ver))
+        table = version_adapter.discover_adapters(
+            package=self._fake_pkg, directories=[self._dir]
+        )
+        for _vd, ver in versions:
+            self.assertIsNotNone(
+                version_adapter.get_adapter(ver, table), f"missing adapter for {ver}"
+            )
+
 if __name__ == "__main__":
     unittest.main()

@@ -140,29 +140,26 @@ def get_supported_versions() -> list[str]:
     ]
 
 
-def _apply_version_adapter(version: str, *, fallback: Optional[object] = None) -> None:
+def _apply_version_adapter(version: str, ascend_version: Optional[str] = None) -> None:
     """补丁收敛(9.1 阶段 4): 按版本查适配器注册表并应用。
 
-    已迁移版本(如 0.26.0)由 ``v0XYZ/adapter.py`` 统一驱动;未迁移版本走
-    调用方提供的 ``fallback``(旧 match 分支的 import 序列)。新版本适配
-    只需新增 adapter.py,不再修改本函数的版本分派。
+    已迁移版本由 ``v0XYZ/adapter.py`` 统一驱动;``ascend_version`` 为
+    对齐后的 vllm-ascend 版本(个别适配器需要区分,如 v0180 的 0.17.0
+    别名分支)。适配器缺失时告警(新版本只需新增 adapter.py,零改动分派)。
     """
     from ucm.integration.vllm.patch.version_adapter import get_adapter
 
     adapter = get_adapter(version)
-    if adapter is not None:
-        missing = adapter.verify_engine_patches()
-        if missing:
-            logger.warning(
-                f"Version adapter {version} missing engine patch archives: "
-                f"{', '.join(missing)}"
-            )
-        adapter.apply()
+    if adapter is None:
+        logger.warning(f"No version adapter for vLLM {version}; skipped.")
         return
-    if fallback is not None:
-        fallback()
-        return
-    logger.warning(f"No version adapter for vLLM {version}; skipped.")
+    missing = adapter.verify_engine_patches()
+    if missing:
+        logger.warning(
+            f"Version adapter {version} missing engine patch archives: "
+            f"{', '.join(missing)}"
+        )
+    adapter.apply(ascend_version)
 
 
 def apply_all_patches() -> None:
@@ -217,25 +214,10 @@ def apply_all_patches() -> None:
             logger.info("UCM patching vllm-ascend UCM connector metrics alias...")
             import ucm.integration.vllm.patch.ucm_connector_registration_patch
 
-        # Apply vllm/vllm-ascend version-specific patches
-        # vllm patches
-        match version:
-            case "0.11.0":
-                logger.info("UCM patching vllm for pc...")
-                import ucm.integration.vllm.patch.v0110.vllm.pc_patch
-
-                if ENABLE_SPARSE:
-                    logger.info("UCM patching vllm for sparse...")
-                    import ucm.integration.vllm.patch.v0110.vllm.sparse_patch
-            case "0.18.0":
-                logger.info("UCM patching vllm for pc...")
-                import ucm.integration.vllm.patch.v0180.vllm.pc_patch
-            case "0.19.1":
-                logger.info("UCM patching vllm for pc...")
-                import ucm.integration.vllm.patch.v0191.vllm.pc_patch
-            case _:
-                pass
-
+        # Apply version-specific patches.
+        # vLLM 侧与 vllm-ascend 侧共用同一版本适配器(补丁收敛 9.1 阶段 4):
+        # 各版本 v0XYZ/adapter.py 统一声明并安装在 vllm-ascend 分派处,
+        # vllm 侧差异(如 0.11.0/0.18.0/0.19.1 的 pc_patch)已收进适配器。
         major, minor, *_ = version.split(".")
         if (int(major), int(minor)) >= (0, 18):
             logger.info("UCM patching vllm for load-failure recovery...")
@@ -247,92 +229,27 @@ def apply_all_patches() -> None:
         logger.info("UCM patching vllm-ascend bind_memory to no-op...")
         import ucm.integration.vllm.patch.bind_memory_patch
 
-        match ascend_version:
-            case "0.11.0":
-                logger.info("UCM patching vllm-ascend for pc...")
-                import ucm.integration.vllm.patch.v0110.vllm_ascend.pc_ascend_patch
-
-                if ENABLE_SPARSE:
-                    logger.info("UCM patching vllm-ascend for sparse...")
-                    import ucm.integration.vllm.patch.v0110.vllm_ascend.sparse_ascend_patch
-            case "0.18.0":
-                logger.info("UCM patching vllm-ascend for pc...")
-                import ucm.integration.vllm.patch.v0180.vllm_ascend.pc_ascend_patch
-            case "0.17.0":
-                logger.info(f"UCM patching vllm-ascend {ascend_version} for pc...")
-                import ucm.integration.vllm.patch.v0180.vllm_ascend.ucm_connector_patch
-            case "0.19.1":
-                logger.info(f"UCM patching vllm-ascend {ascend_version} for pc...")
-                import ucm.integration.vllm.patch.v0191.vllm_ascend.cpu_binding_patch
-                import ucm.integration.vllm.patch.v0191.vllm_ascend.pc_ascend_patch
-            case "0.20.2":
-                logger.info(
-                    "UCM patching vllm-ascend 0.20.2 for hybrid cache recovery..."
-                )
-                import ucm.integration.vllm.patch.v0202.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0202.vllm_ascend.cpu_binding_patch
-            case "0.21.0":
-                logger.info(
-                    "UCM patching vllm-ascend 0.21.0 for hybrid cache recovery..."
-                )
-                import ucm.integration.vllm.patch.v0210.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0210.vllm_ascend.cpu_binding_patch
-            case "0.22.1":
-                logger.info(
-                    "UCM patching vllm-ascend 0.22.1 for hybrid cache "
-                    "recovery and CPU affinity..."
-                )
-                import ucm.integration.vllm.patch.v0221.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0221.vllm_ascend.cpu_binding_patch
-            case "0.23.0":
-                logger.info(
-                    "UCM patching vllm-ascend 0.23.0 for hybrid cache "
-                    "recovery, CPU affinity, and SFA KV transfer..."
-                )
-                import ucm.integration.vllm.patch.v0230.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0230.vllm_ascend.cpu_binding_patch
-                import ucm.integration.vllm.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
-            case "0.24.0":
-                logger.info(
-                    "UCM patching vllm-ascend 0.24.0 for hybrid cache "
-                    "recovery and CPU affinity..."
-                )
-                import ucm.integration.vllm.patch.v0240.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0240.vllm_ascend.cpu_binding_patch
-            case "0.25.1":
-                logger.info(
-                    "UCM patching vllm-ascend 0.25.1 for hybrid cache "
-                    "recovery and CPU affinity..."
-                )
-                import ucm.integration.vllm.patch.v0251.vllm_ascend.ascend_hybrid_cache_patch
-                import ucm.integration.vllm.patch.v0251.vllm_ascend.cpu_binding_patch
-            case "0.26.0":
-                # 补丁收敛(9.1 阶段 4)首个适配器: v0260/adapter.py 统一驱动。
-                logger.info("UCM patching vllm-ascend 0.26.0 via adapter...")
-                _apply_version_adapter("0.26.0")
-            case "0.27.0":
-                # 0.27.0: no version-specific UCM patch yet. The Ascend hybrid
-                # prefix-cache fix (per-group AND / fixed-point truncation) has
-                # moved upstream since 0.26.0, so the old UCM coordinator
-                # wrapper no longer applies; keep the case explicit to surface
-                # any future API drift instead of silently falling through.
-                logger.info(
-                    "UCM patching vllm-ascend 0.27.0: no version-specific "
-                    "patches needed (hybrid prefix-cache fix lives upstream)."
-                )
-            case "0.28.0":
-                # 0.28.0: mamba (Qwen3.5-style) prefix caching is enabled
-                # upstream; UCM's external KV path is driven by the engine only
-                # when blocks are offloaded. No UCM-side coordinator patch is
-                # required; the KVCacheGroupManager double-run ledger still
-                # validates the spec-table mapping on this engine (see
-                # hla_connector/hma_connector UCM_SPEC_TABLE_DOUBLE_RUN).
-                logger.info(
-                    "UCM patching vllm-ascend 0.28.0: no version-specific "
-                    "patches needed (mamba prefix caching supported upstream)."
-                )
-            case _:
-                pass
+        # 同一注册表按 vLLM 版本驱动(vllm-ascend 版本已对齐,见上)。
+        # 0.26.0 之前的版本已全部迁移为版本适配器;0.28.0 无版本目录
+        # (上移引擎),与 0.27.0/0.28.0 一样由对应适配器声明"无需补丁"或
+        # 在此显式声明。
+        if ascend_version in ("0.27.0",):
+            _apply_version_adapter("0.27.0", ascend_version)
+        elif ascend_version == "0.28.0":
+            # 0.28.0: mamba (Qwen3.5-style) prefix caching is enabled
+            # upstream; UCM's external KV path is driven by the engine only
+            # when blocks are offloaded. No UCM-side coordinator patch is
+            # required; the KVCacheGroupManager double-run ledger still
+            # validates the spec-table mapping on this engine (see
+            # hla_connector/hma_connector UCM_SPEC_TABLE_DOUBLE_RUN).
+            logger.info(
+                "UCM patching vllm-ascend 0.28.0: no version-specific "
+                "patches needed (mamba prefix caching supported upstream)."
+            )
+        elif ascend_version is not None:
+            _apply_version_adapter(ascend_version, ascend_version)
+        else:
+            _apply_version_adapter(version, None)
 
         # Fix: vllm-ascend >= 0.21.0 defers do_mamba_copy_block to after
         # start_load_kv, overwriting UCM-loaded data. @when_imported is

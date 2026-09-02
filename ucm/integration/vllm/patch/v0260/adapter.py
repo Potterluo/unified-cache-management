@@ -20,7 +20,7 @@ ASCEND_VERSIONS = ("0.26.0",)
 REQUIRED_ENGINE_PATCHES = ("v0260-combined.patch",)
 
 
-def apply() -> None:
+def apply(ascend_version: str | None = None) -> None:
     """安装 0.26.0 的全部运行期注入(cpu_binding 补丁,幂等)。"""
     from ucm.integration.vllm.patch.v0260.vllm_ascend import cpu_binding_patch
 
