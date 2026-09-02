@@ -284,6 +284,27 @@ def apply_all_patches() -> None:
             case "0.26.0":
                 logger.info("UCM patching vllm-ascend 0.26.0 for CPU affinity...")
                 import ucm.integration.vllm.patch.v0260.vllm_ascend.cpu_binding_patch
+            case "0.27.0":
+                # 0.27.0: no version-specific UCM patch yet. The Ascend hybrid
+                # prefix-cache fix (per-group AND / fixed-point truncation) has
+                # moved upstream since 0.26.0, so the old UCM coordinator
+                # wrapper no longer applies; keep the case explicit to surface
+                # any future API drift instead of silently falling through.
+                logger.info(
+                    "UCM patching vllm-ascend 0.27.0: no version-specific "
+                    "patches needed (hybrid prefix-cache fix lives upstream)."
+                )
+            case "0.28.0":
+                # 0.28.0: mamba (Qwen3.5-style) prefix caching is enabled
+                # upstream; UCM's external KV path is driven by the engine only
+                # when blocks are offloaded. No UCM-side coordinator patch is
+                # required; the KVCacheGroupManager double-run ledger still
+                # validates the spec-table mapping on this engine (see
+                # hla_connector/hma_connector UCM_SPEC_TABLE_DOUBLE_RUN).
+                logger.info(
+                    "UCM patching vllm-ascend 0.28.0: no version-specific "
+                    "patches needed (mamba prefix caching supported upstream)."
+                )
             case _:
                 pass
 
