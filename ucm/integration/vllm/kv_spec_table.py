@@ -128,6 +128,13 @@ class SpecRow:
     seed: Optional[str] = None
     rank_rule: Optional[RankRule] = None
     retention: Optional[RetentionPolicy] = None
+    # 窗口归属轴: None=全注意力(FA)组;非 None=窗口(WA)组,值为窗口大小。
+    # 混合注意力布局(如 DS-V4 MLA+SWA)的连接器据此分类 FA/WA 组归属,
+    # 不再在 Connector 内用 sliding_window/tensor 名等启发式猜归属。
+    sliding_window: Optional[int] = None
+    # UCM 侧该组保留的尾 token 数(仅 WA 组必须声明;FA 组默认 None)。
+    # 由构建方折算引擎张量名/层压缩比后填入,连接器只读此列。
+    tail_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.kind is CacheKind.NONE:
@@ -137,6 +144,12 @@ class SpecRow:
         else:
             assert self.block_size is not None and self.block_size > 0, (
                 f"组 {self.group_name} 的 block_size 必须为正整数," f"实际 {self.block_size!r}"
+            )
+        if self.sliding_window is not None:
+            assert self.tail_tokens is not None and self.tail_tokens > 0, (
+                f"WA 组 {self.group_name} 必须声明 UCM 侧尾 token 数"
+                f"(sliding_window={self.sliding_window}, "
+                f"tail_tokens={self.tail_tokens!r})"
             )
 
 

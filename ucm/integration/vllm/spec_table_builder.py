@@ -40,6 +40,7 @@ KVCacheGroupMeta``),实现本报告的规格表时要先在**不改变旧逻辑*
 
 import math
 import os
+import re
 from typing import Callable, Iterable, Optional, Sequence
 
 from vllm.v1.kv_cache_interface import (
@@ -126,6 +127,60 @@ def is_mamba_align_spec(spec: KVCacheSpec) -> bool:
     return isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
 
 
+def _extract_layer_index(name: str) -> int:
+    """从 layer 张量名提取层号(vllm 同语义的纯函数复刻)。
+
+    不 import ``vllm.model_executor.models.utils``: 该模块顶层会拖入整棵
+    model_executor 依赖树(裸环境/单测假 vllm 下不可加载);层号解析本身是
+    纯字符串正则,与 vllm 的 ``extract_layer_index`` 语义一致。
+    """
+    match = re.search(r"layers\.(\d+)", name)
+    if match is None:
+        raise ValueError(f"cannot extract layer index from {name!r}")
+    return int(match.group(1))
+
+
+def sliding_window_from_spec(spec: KVCacheSpec) -> Optional[int]:
+    """窗口归属轴(4.1): None=FA 组(全注意力),非 None=WA 组(窗口大小)。
+
+    混合注意力布局(DS-V4 MLA+SWA)的 FA/WA 归属由此列唯一决定,Connector
+    不再用 sliding_window/tensor 名等启发式猜归属。UniformType 组的成员
+    归属必须一致(不能 FA/WA 混组),窗口大小取唯一非 None 值。
+    """
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        windows = {sliding_window_from_spec(s) for s in spec.kv_cache_specs.values()}
+        windows.discard(None)
+        if len(windows) > 1:
+            raise ValueError(
+                "窗口归属轴歧义: Uniform 组内成员窗口大小不一致 "
+                f"{sorted(windows)}"
+            )
+        return next(iter(windows), None)
+    return int(getattr(spec, "sliding_window", 0) or 0) or None
+
+
+def tail_tokens_from_spec(
+    spec: KVCacheSpec,
+    layer_names: Sequence[str],
+    layer_compress_ratios: Optional[Sequence[int]],
+) -> Optional[int]:
+    """WA 组在 UCM 侧保留的尾 token 数(仅 WA 组返回;FA 组返回 None)。
+
+    把旧 FAWA 连接器里的定制启发式数据化到此列(替换按 tensor 名猜
+    swa_cache / compressor 状态组的分支): SWA 缓存保留完整窗口尾,
+    compressor 状态组只保留未压缩尾(窗口 - 层压缩比)。
+    """
+    window_size = sliding_window_from_spec(spec)
+    if window_size is None:
+        return None
+    if layer_names and layer_names[0].rsplit(".", 1)[-1] in ("swa_cache",):
+        return window_size
+    if layer_compress_ratios is None:
+        return None
+    layer_index = _extract_layer_index(layer_names[0])
+    return window_size - layer_compress_ratios[layer_index]
+
+
 def is_mla_spec(spec: KVCacheSpec) -> bool:
     """MLA 组判断: 内容跨 rank 相同(共享池去重成立),秩规则 = all_union。
 
@@ -204,11 +259,15 @@ def build_spec_table(
     kv_cache_groups: Sequence,
     *,
     group_seeds: Optional[Sequence[str]] = None,
+    layer_compress_ratios: Optional[Sequence[int]] = None,
 ) -> SpecTable:
     """从 vLLM ``KVCacheConfig.kv_cache_groups`` 构建规格表(4.1)。
 
     ``group_seeds``: 可选的每组哈希种子(与旧逻辑同源,记账比对用);不传则由
     ``_group_tag`` 派生稳定标签。
+    ``layer_compress_ratios``: 可选的每层压缩比(hf_config.compress_ratios),
+    用于折算 WA 组的 UCM 尾长(``tail_tokens`` 列);缺省时 WA 行尾长取
+    sliding_window(swa_cache 张量)或留空交由连接器在归属时裁决。
     """
     rows: list[SpecRow] = []
     for group_id, group in enumerate(kv_cache_groups):
@@ -238,6 +297,12 @@ def build_spec_table(
                 seed=seed,
                 rank_rule=rank_rule,
                 retention=retention,
+                sliding_window=sliding_window_from_spec(spec),
+                tail_tokens=tail_tokens_from_spec(
+                    spec,
+                    group.layer_names,
+                    layer_compress_ratios,
+                ),
             )
         )
     return SpecTable(rows)

@@ -349,6 +349,26 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         # The maximum token block size across all groups, used for aligning the number of computed tokens in the scheduler.
         self.max_token_block_size = 0
+        # 规格表(4.1)须先于组归属构建: FA/WA 归属与每组 canonical 尾长由规格表
+        # 行数据驱动(4.1 归属轴),不再走连接器内启发式。构建条件:
+        # DOUBLE_RUN(双跑记账)或 AUTHORITATIVE(切新主裁决)时构建;
+        # 两个开关都关时 _init_group_metas 走旧启发式 fallback(零行为变化)。
+        self._spec_table_double_run = None
+        if (
+            role == KVConnectorRole.SCHEDULER
+            and (spec_table_double_run_enabled() or spec_table_authoritative_enabled())
+        ):
+            from ucm.integration.vllm.spec_table_builder import build_spec_table
+
+            hf_config = self._vllm_config.model_config.hf_config
+            self._spec_table_double_run = build_spec_table(
+                self._kv_cache_config.kv_cache_groups,
+                layer_compress_ratios=getattr(hf_config, "compress_ratios", None),
+            )
+            logger.info(
+                "[double-run] FAWA spec table:\n%s",
+                repr(self._spec_table_double_run),
+            )
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
@@ -385,27 +405,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"group_metas={group_meta_summary}"
         )
 
-        # 规格表(4.1): DOUBLE_RUN(双跑记账)或 AUTHORITATIVE(切新主裁决)时构建。
-        # FAWA 的 canonical 哈希空间统一(不像 HLA 每组建独立哈希链),组件投票
-        # 在 FAWA 侧 = fa_store(FA 组)前缀 × wa_store(窗口组)边界 的两段查询
-        # (4.2 的 (l, p*) 形态);规格表在此提供组几何/刻度与记账载体。
-        self._spec_table_double_run = None
-        if (
-            role == KVConnectorRole.SCHEDULER
-            and (spec_table_double_run_enabled() or spec_table_authoritative_enabled())
-        ):
-            from ucm.integration.vllm.spec_table_builder import (
-                build_spec_table,
-                double_run_ledger,
-            )
+        # 规格表(4.1)已提前构建(在 _init_group_metas 之前)。FAWA 的 canonical
+        # 哈希空间统一(不像 HLA 每组建独立哈希链),组件投票在 FAWA 侧 =
+        # fa_store(FA 组)前缀 × wa_store(窗口组)边界 的两段查询(4.2 的 (l, p*)
+        # 形态);规格表在此提供组几何/刻度与记账载体。
+        if self._spec_table_double_run is not None:
+            from ucm.integration.vllm.spec_table_builder import double_run_ledger
 
-            self._spec_table_double_run = build_spec_table(
-                self._kv_cache_config.kv_cache_groups
-            )
-            logger.info(
-                "[double-run] FAWA spec table:\n%s",
-                repr(self._spec_table_double_run),
-            )
             for msg in double_run_ledger(
                 self._spec_table_double_run,
                 [self.group_metas[i] for i in sorted(self.group_metas)],
@@ -516,19 +522,22 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         groups = self._kv_cache_config.kv_cache_groups
         self.fa_group_ids, self.window_group_ids = [], []
+        spec_table = self._spec_table_double_run
         layer_compress_ratios = getattr(
             self._vllm_config.model_config.hf_config,
             "compress_ratios",
             None,
         )
         if layer_compress_ratios is None:
-            raise ValueError("current only support DSV4")
+            if spec_table is None:
+                # 仅在非规格表模式(双跑/权威开关全关)下仍约束 DSV4 布局。
+                raise ValueError("current only support DSV4")
+            layer_compress_ratios = ()
         for group_id, group in enumerate(groups):
             kv_cache_spec = group.kv_cache_spec
             # Use the representative spec when vLLM wraps multiple layer specs.
             nested_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
             spec = next(iter(nested_specs.values())) if nested_specs else kv_cache_spec
-            window_size = getattr(spec, "sliding_window", None)
             compress_ratio = getattr(spec, "compress_ratio", 1)
             token_block_size = kv_cache_spec.block_size
             if self.is_ascend_layout:
@@ -536,22 +545,35 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 # the compression ratio.
                 token_block_size = kv_cache_spec.block_size * compress_ratio
 
-            if window_size is None:
-                # FA groups store one canonical hash block per row.
-                tail_tokens = self.hash_block_size
-                self.fa_group_ids.append(group_id)
-            else:
-                tensor_name = group.layer_names[0]
-                if tensor_name.split(".")[-1] in ["swa_cache"]:
-                    # SWA caches keep the full sliding-window tail.
-                    tail_tokens = window_size
+            if spec_table is not None:
+                # 规格表驱动归属(4.1 归属轴): 行序 = kv_cache_groups 序
+                # (build_spec_table 按 enumerate 顺序构建)。WA 行尾长已由
+                # 构建方折算进 tail_tokens 列,此处只读,不重复推演。
+                row = spec_table.rows[group_id]
+                if row.sliding_window is None:
+                    # FA groups store one canonical hash block per row.
+                    tail_tokens = self.hash_block_size
+                    self.fa_group_ids.append(group_id)
                 else:
-                    # Compressor state caches keep only the uncompressed tail.
-                    layer_index = extract_layer_index(tensor_name)
-                    tail_tokens = window_size - layer_compress_ratios[layer_index]
-
-                tail_blocks = tail_tokens // token_block_size
-                self.window_group_ids.append(group_id)
+                    tail_tokens = row.tail_tokens
+                    self.window_group_ids.append(group_id)
+            else:
+                # Fallback: 双跑/权威开关全关时的旧启发式,与历史行为一致。
+                window_size = getattr(spec, "sliding_window", None)
+                if window_size is None:
+                    # FA groups store one canonical hash block per row.
+                    tail_tokens = self.hash_block_size
+                    self.fa_group_ids.append(group_id)
+                else:
+                    tensor_name = group.layer_names[0]
+                    if tensor_name.split(".")[-1] in ["swa_cache"]:
+                        # SWA caches keep the full sliding-window tail.
+                        tail_tokens = window_size
+                    else:
+                        # Compressor state caches keep only the uncompressed tail.
+                        layer_index = extract_layer_index(tensor_name)
+                        tail_tokens = window_size - layer_compress_ratios[layer_index]
+                    self.window_group_ids.append(group_id)
 
             tail_blocks = max(tail_tokens // token_block_size, 1)
             self.max_token_block_size = max(self.max_token_block_size, token_block_size)
@@ -880,13 +902,6 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             return 0
         return reverse_idx + 1
 
-    @staticmethod
-    def _fawa_row_group_id(row: "SpecRow") -> int:
-        """从规格表行名解析 FAWA 组号: 行名形如 ``mla0`` / ``group3``,尾号为组号。"""
-        name = row.group_name
-        digits = "".join(ch for ch in name if ch.isdigit())
-        return int(digits or -1)
-
     def _lookup_external_hit_blocks_authoritative(
         self,
         external_keys: list[bytes],
@@ -933,7 +948,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             return max(fa_hit_blocks, 0) * self.hash_block_size
 
         def row_is_fa(row: "SpecRow") -> bool:
-            return self._fawa_row_group_id(row) in set(self.fa_group_ids)
+            # 归属轴由规格表行数据直接表达,不再做行名尾号解析。
+            return row.sliding_window is None
 
         total_hit_tokens, _ = resolve_hit(
             spec,

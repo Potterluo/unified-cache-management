@@ -59,17 +59,25 @@ def _install_fake_vllm():
         block_size = None
 
     class FullAttentionSpec(KVCacheSpec):
-        def __init__(self, block_size):
+        def __init__(self, block_size, sliding_window=None, compress_ratio=None):
             self.block_size = block_size
+            if sliding_window is not None:
+                self.sliding_window = sliding_window
+            if compress_ratio is not None:
+                self.compress_ratio = compress_ratio
 
     class MLAAttentionSpec(KVCacheSpec):
-        def __init__(self, block_size):
+        def __init__(self, block_size, sliding_window=None):
             self.block_size = block_size
+            if sliding_window is not None:
+                self.sliding_window = sliding_window
 
     class MambaSpec(KVCacheSpec):
-        def __init__(self, block_size, mamba_cache_mode="align"):
+        def __init__(self, block_size, mamba_cache_mode="align", sliding_window=None):
             self.block_size = block_size
             self.mamba_cache_mode = mamba_cache_mode
+            if sliding_window is not None:
+                self.sliding_window = sliding_window
 
     class UniformTypeKVCacheSpecs:
         def __init__(self, kv_cache_specs):
@@ -512,6 +520,103 @@ class ResolveVsLegacyEquivalenceTest(unittest.TestCase):
         )
         self.assertEqual(l_new, l_legacy)
         self.assertEqual(l_new, 0)
+
+
+class WindowGroupSpecTest(unittest.TestCase):
+    """4.1 归属轴: sliding_window/tail_tokens 由规格表行数据承载(去硬编码)。"""
+
+    def _fa_spec(self, block_size=128):
+        return fake_vllm.FullAttentionSpec(block_size=block_size)
+
+    def _swa_spec(self, block_size=32, window=2048):
+        return fake_vllm.MLAAttentionSpec(block_size=block_size, sliding_window=window)
+
+    def _ascend_c4_spec(self, block_size=32, compress_ratio=4):
+        # DS-V4 C4 FA 组: 无窗口 + 压缩比 4(引擎 storage 刻度 32)。
+        return fake_vllm.FullAttentionSpec(
+            block_size=block_size, compress_ratio=compress_ratio
+        )
+
+    def test_fa_group_has_no_window(self):
+        spec = self._fa_spec()
+        self.assertIsNone(
+            spec_table_builder.sliding_window_from_spec(spec),
+            "FA 组归属轴必须为 None",
+        )
+        self.assertIsNone(
+            spec_table_builder.tail_tokens_from_spec(spec, ("layers.0.kv_cache",), None)
+        )
+
+    def test_swa_group_window_and_tail(self):
+        spec = self._swa_spec(window=2048)
+        self.assertEqual(spec_table_builder.sliding_window_from_spec(spec), 2048)
+        # swa_cache 张量保留完整窗口尾。
+        self.assertEqual(
+            spec_table_builder.tail_tokens_from_spec(
+                spec, ("layers.2.swa_cache",), (32, 64)
+            ),
+            2048,
+        )
+
+    def test_compressor_group_tail_discounts_layer_ratio(self):
+        spec = self._swa_spec(window=4096)
+        # compressor 状态组只保留未压缩尾: 窗口 - 层压缩比(layer 2 = 32)。
+        self.assertEqual(
+            spec_table_builder.tail_tokens_from_spec(
+                spec, ("layers.2.compressor_kv_cache",), (8, 16, 32)
+            ),
+            4096 - 32,
+        )
+
+    def test_uniform_member_window_must_agree(self):
+        mixed = fake_vllm.UniformTypeKVCacheSpecs(
+            {"a": self._swa_spec(window=2048), "b": self._swa_spec(window=1024)}
+        )
+        with self.assertRaises(ValueError):
+            spec_table_builder.sliding_window_from_spec(mixed)
+        agreed = fake_vllm.UniformTypeKVCacheSpecs(
+            {"a": self._swa_spec(window=2048), "b": self._fa_spec()}
+        )
+        self.assertEqual(
+            spec_table_builder.sliding_window_from_spec(agreed), 2048
+        )
+
+    def test_build_spec_table_carries_ownership_columns(self):
+        groups = [
+            _group(
+                self._ascend_c4_spec(),
+                layer_names=("layers.0.kv_cache",),
+            ),
+            _group(
+                self._swa_spec(window=2048),
+                layer_names=("layers.2.swa_cache",),
+            ),
+            _group(
+                self._swa_spec(window=4096),
+                layer_names=("layers.2.compressor_kv_cache",),
+            ),
+        ]
+        table = spec_table_builder.build_spec_table(
+            groups, layer_compress_ratios=(4, 4, 32)
+        )
+        fa, swa, comp = table.rows
+        self.assertIsNone(fa.sliding_window)
+        self.assertIsNone(fa.tail_tokens)
+        self.assertEqual(swa.sliding_window, 2048)
+        self.assertEqual(swa.tail_tokens, 2048)
+        self.assertEqual(comp.sliding_window, 4096)
+        self.assertEqual(comp.tail_tokens, 4096 - 32)
+
+    def test_wa_row_without_tail_data_fails_loudly(self):
+        # 无 compress_ratios 时 compressor 尾长无法折算 => 显式失败而非静默硬编码。
+        groups = [
+            _group(
+                self._swa_spec(window=4096),
+                layer_names=("layers.5.compressor_kv_cache",),
+            )
+        ]
+        with self.assertRaises(AssertionError):
+            spec_table_builder.build_spec_table(groups, layer_compress_ratios=None)
 
 
 if __name__ == "__main__":
