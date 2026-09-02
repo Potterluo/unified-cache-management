@@ -166,6 +166,48 @@ class SnapshotStoreTest(unittest.TestCase):
             self.assertEqual(s2.get(2048, b"p"), b"b")  # 未淘汰条目可读回
 
 
+class SharedSnapshotStoreTest(unittest.TestCase):
+    """7.6 R4: 进程内共享快照存储注册表(dump Put / load Get 同实例)。"""
+
+    def tearDown(self):
+        snapshot_store._snapshot_store_registry.clear()
+
+    def test_same_group_key_shares_instance(self):
+        a = snapshot_store.shared_snapshot_store((3072, 1), "g1")
+        b = snapshot_store.shared_snapshot_store((3072, 1), "g1")
+        self.assertIs(a, b)
+
+    def test_different_group_key_distinct(self):
+        a = snapshot_store.shared_snapshot_store((3072, 1), "g1")
+        b = snapshot_store.shared_snapshot_store((3072, 2), "g2")
+        c = snapshot_store.shared_snapshot_store((1024, 1), "g3")
+        self.assertIsNot(a, b)
+        self.assertIsNot(a, c)
+        self.assertIsNot(b, c)
+
+    def test_put_get_across_instances(self):
+        # worker 侧与 SCHEDULER 侧各自调用 shared_snapshot_store,必须互见。
+        worker = snapshot_store.shared_snapshot_store((3072, 1), "g1")
+        scheduler = snapshot_store.shared_snapshot_store((3072, 1), "g1")
+        prefix = b"p" * 16
+        self.assertTrue(worker.put(3072, prefix, b"state-bytes"))
+        # 重复 Put 幂等(首次提交获胜,7.4)。
+        self.assertFalse(worker.put(3072, prefix, b"other"))
+        self.assertEqual(scheduler.get(3072, prefix), b"state-bytes")
+        # Get = CoW: 改返回值不影响存储内条目。
+        got = scheduler.get(3072, prefix)
+        got += b"x"
+        self.assertEqual(worker.get(3072, prefix), b"state-bytes")
+
+    def test_registry_survives_reload_calls(self):
+        # 注册表跨连接器实例化(worker/scheduler 各 new 一次 connector)保持。
+        first = snapshot_store.shared_snapshot_store((3072, 3), "g3")
+        first.put(3072, b"k" * 8, b"v")
+        second = snapshot_store.shared_snapshot_store((3072, 3), "g3")
+        self.assertIs(first, second)
+        self.assertEqual(second.get(3072, b"k" * 8), b"v")
+
+
 class SnapshotGroupTest(unittest.TestCase):
     """4.3 惰性失效 + 算例 C 风格的目录联动。"""
 

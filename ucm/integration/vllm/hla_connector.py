@@ -74,12 +74,27 @@ class HLARequestDispatchMeta(RequestDispatchMeta):
     边界及其主组前缀哈希(4.3 检查点键 = (组, 位置, 前缀哈希))。由 SCHEDULER
     侧 ``_generate_hla_dispatch_meta`` 计算并随 metadata 下发,worker
     ``wait_for_save`` 登记时零推算。
+
+    阶段 2(SnapshotStore,7.6 R4)透传字段:
+    - ``state_dump_blocks``: 本步实际落盘的状态块 (group_id, vllm_block_id),
+      worker 在 dump 确认后取块字节按 (last_lcm_b, primary_prefix_hash)
+      位置键 Put 进 SnapshotStore(仅状态真落盘时非空);
+    - ``snapshot_position`` / ``snapshot_prefix_hash``: authoritative 命中时
+      检查点目录裁决的 p* 绝对位置及其主组前缀哈希(4.3 位置键),load 侧
+      Get 的键;
+    - ``state_load_blocks``: 本次 load 计划中的状态块 (group_id,
+      vllm_block_id);SnapshotStore 命中时从旧 store load 列表剔除,改由
+      快照字节直写引擎状态槽(prev_state_idx 块,round-4 槽位语义)。
     """
 
     load_full_attn_count: int = 0
     dump_full_attn_count: int = 0
     last_lcm_b: int = 0
     primary_prefix_hash: Optional[bytes] = None
+    state_dump_blocks: tuple[tuple[int, int], ...] = ()
+    snapshot_position: int = 0
+    snapshot_prefix_hash: Optional[bytes] = None
+    state_load_blocks: tuple[tuple[int, int], ...] = ()
 
 
 def layer_name_to_kv_cache_spec(
@@ -1591,6 +1606,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         total_hit_tokens = req_meta.total_hit_block_num * lcm_block_size
 
         if need_load and external_hit_lcm_blocks > 0:
+            state_load_blocks: list[tuple[int, int]] = []
             # Pass 1: full-attention blocks first (for MLA rank-0-only dump)
             for gid, group in enumerate(groups_by_id):
                 if group.is_mamba_align:
@@ -1612,6 +1628,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             for gid, group in enumerate(groups_by_id):
                 if not group.is_mamba_align:
                     continue
+                before = len(load_vllm_block_ids)
                 self._append_mamba_align_state_block(
                     load_ucm_block_ids,
                     load_vllm_block_ids,
@@ -1621,8 +1638,35 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     total_hit_tokens,
                     "load",
                 )
+                if len(load_vllm_block_ids) > before:
+                    state_load_blocks.append((gid, load_vllm_block_ids[-1]))
         else:
             load_full_attn_count = 0
+            state_load_blocks = []
+
+        # 阶段 2(7.6 R4): authoritative 命中时,快照 p*(检查点目录裁决)及其
+        # 主组前缀哈希透传给 load 侧 -- SnapshotStore.Get 的位置键
+        # (位置, 前缀哈希),与 dump 侧 Put 的键同源(4.3)。
+        snapshot_position = 0
+        snapshot_prefix_hash = None
+        if (
+            need_load
+            and state_load_blocks
+            and spec_table_authoritative_enabled()
+            and self.group_manager is not None
+            and self.group_manager._spec_table_double_run is not None
+            and req_meta.token_processed > 0
+        ):
+            p_star = self.group_manager.snapshot_p_star_from_directory(
+                req_meta.token_processed,
+                total_hit_tokens,
+                req_meta.group_ucm_block_ids,
+            )
+            if p_star > req_meta.token_processed:
+                snapshot_position = p_star
+                snapshot_prefix_hash = self.group_manager.checkpoint_prefix_hash(
+                    p_star, req_meta.group_ucm_block_ids
+                )
 
         last_lcm_b = 0
         if req_meta.token_processed < req_meta.num_token_ids:
@@ -1650,11 +1694,13 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
             # Pass 2: mamba state blocks
             state_dump_start_len = len(dump_ucm_block_ids)
+            state_dump_blocks: list[tuple[int, int]] = []
             for gid, group in enumerate(groups_by_id):
                 if not group.is_mamba_align:
                     continue
                 if dump_tok_end != last_lcm_b or last_lcm_b < first_lcm_b:
                     continue
+                before = len(dump_vllm_block_ids)
                 self._append_mamba_align_state_block(
                     dump_ucm_block_ids,
                     dump_vllm_block_ids,
@@ -1664,6 +1710,8 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                     last_lcm_b,
                     "dump",
                 )
+                if len(dump_vllm_block_ids) > before:
+                    state_dump_blocks.append((gid, dump_vllm_block_ids[-1]))
             # 本步 mamba 状态是否**实际加入 dump 计划**(Pass-2 真 append 了状态块)。
             # 只有真正落盘的状态位置才能登记检查点(4.3);仅凭 KV 块存在就登记
             # 会让目录谎报"3072 有状态" -> authoritative 深信 p*=3072 跳过计算
@@ -1673,6 +1721,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         else:
             dump_full_attn_count = 0
             state_dumped = False
+            state_dump_blocks = []
 
         req_meta.token_processed += new_tokens
 
@@ -1694,6 +1743,10 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_full_attn_count,
             last_lcm_b_carried,
             primary_prefix_hash,
+            tuple(state_dump_blocks),
+            snapshot_position,
+            snapshot_prefix_hash,
+            tuple(state_load_blocks),
         )
 
     def build_connector_meta(
@@ -1808,6 +1861,176 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         scoped = [self.request_hasher(b) for b in ucm_ids]
         return ucm_ids, scoped, vllm_ids
 
+    def _snapshot_lcm(self) -> int:
+        """快照组几何的 LCM(store 注册表键的"组几何指纹"维度)。"""
+        if self.group_manager is not None:
+            return self.group_manager.lcm_block_size
+        assert self._kv_cache_config is not None
+        lcm, _state_groups, _primary = group_geometry_from_kv_cache_config(
+            self._kv_cache_config
+        )
+        return lcm
+
+    def _snapshot_state_layer_name(self, gid: int) -> Optional[str]:
+        """状态组行的代表 layer 名(取块字节/写块字节用)。
+
+        SCHEDULER 侧用 GroupInfo.layer_names;worker 侧没有 group_manager,
+        从 ``_kv_cache_config`` 重建。行内多 layer 共享同一 raw_tensor
+        (Ascend component-major),取任一层即可。
+        """
+        if self.group_manager is not None:
+            info = self.group_manager.groups_by_id.get(gid)
+            if info is not None and info.layer_names:
+                return info.layer_names[0]
+            return None
+        assert self._kv_cache_config is not None
+        groups = self._kv_cache_config.kv_cache_groups
+        if gid >= len(groups):
+            return None
+        layer_names = groups[gid].layer_names
+        return layer_names[0] if layer_names else None
+
+    @staticmethod
+    def _kv_cache_block(tensor_or_list, blk: int) -> Optional[torch.Tensor]:
+        """从 vllm 的 kv_cache 值(tensor 或 [tensor, aux...])取 blk 块张量。
+
+        引擎 register_kv_caches 传的值两种形态都有(tuple/list 含辅助张量),
+        与 ``_collect_shared_tensor_info`` 的解包模式一致。
+        """
+        if isinstance(tensor_or_list, torch.Tensor):
+            tensor = tensor_or_list
+        elif isinstance(tensor_or_list, (tuple, list)) and tensor_or_list:
+            tensor = tensor_or_list[0]
+        else:
+            return None
+        if not isinstance(tensor, torch.Tensor) or blk < 0 or blk >= tensor.shape[0]:
+            return None
+        return tensor[blk]
+
+    def _store_snapshot_payloads_from_meta(
+        self, metadata: "UCMConnectorMetadata",
+    ) -> None:
+        """阶段 2(7.6 R4): 状态块字节按 (位置, 前缀哈希) 位置键 Put 进 SnapshotStore。
+
+        在 dump 落盘确认后调用(与检查点登记同处)。字节 = 状态组行任一层
+        张量的整块(Ascend component-major 布局下块 = 完整 page,conv+ssm+v
+        一体);"首次提交获胜"(7.4),重复 dump 幂等。旧 store 的哈希折叠
+        dump 照旧(兼容回退),快照字节是新的权威源。
+        """
+        from ucm.store.snapshot_store import shared_snapshot_store
+
+        lcm = self._snapshot_lcm()
+        stored = 0
+        for request_id, request in metadata.request_meta.items():
+            boundary = request.last_lcm_b
+            prefix = request.primary_prefix_hash
+            if boundary <= 0 or not prefix or not request.state_dump_blocks:
+                continue
+            for gid, blk in request.state_dump_blocks:
+                layer_name = self._snapshot_state_layer_name(gid)
+                if layer_name is None:
+                    logger.warning(
+                        "snapshot state layer missing: request=%s, gid=%s", request_id, gid
+                    )
+                    continue
+                tensor = self.kv_caches.get(layer_name)
+                block = self._kv_cache_block(tensor, blk)
+                if block is None:
+                    logger.warning(
+                        "snapshot state block missing: request=%s, gid=%s, blk=%s",
+                        request_id,
+                        gid,
+                        blk,
+                    )
+                    continue
+                # bf16 等张量 numpy 不支持: 一律经 uint8 视图取裸字节
+                # (总字节数不变,纯内存重解释)。
+                payload = (
+                    block.contiguous()
+                    .cpu()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                )
+                store = shared_snapshot_store((lcm, gid), str(gid))
+                if store.put(boundary, prefix, payload):
+                    stored += 1
+        if stored:
+            logger.info_once(
+                f"[stage-2] snapshot store Put x{stored} "
+                "(position-keyed, 7.6 R4)"
+            )
+
+    def _collect_snapshot_load_payloads(
+        self, metadata: "UCMConnectorMetadata",
+    ) -> dict[str, list[tuple[int, int, bytes]]]:
+        """load 侧: 对 authoritative 命中请求,按位置键 Get 状态快照(CoW)。
+
+        返回 ``{request_id: [(gid, vllm_block_id, payload), ...]}``;仅含
+        真正命中(store 淘汰/未落盘 => None => 该组走旧路径)。调用方把命中
+        的 vllm_block_id 从旧 store load 列表剔除,再经
+        ``_write_snapshot_state_block`` 直写引擎状态槽。
+        """
+        from ucm.store.snapshot_store import shared_snapshot_store
+
+        lcm = self._snapshot_lcm()
+        out: dict[str, list[tuple[int, int, bytes]]] = {}
+        for request_id, request in metadata.request_meta.items():
+            if not request.state_load_blocks:
+                continue
+            boundary = request.snapshot_position
+            prefix = request.snapshot_prefix_hash
+            if boundary <= 0 or not prefix:
+                continue
+            hits: list[tuple[int, int, bytes]] = []
+            for gid, blk in request.state_load_blocks:
+                store = shared_snapshot_store((lcm, gid), str(gid))
+                payload = store.get(boundary, prefix)
+                if payload is None:
+                    # 快照缺失(未落盘/被淘汰): 该组退回旧 store 路径(漏命安全)。
+                    continue
+                hits.append((gid, blk, payload))
+            if hits:
+                out[request_id] = hits
+        return out
+
+    def _write_snapshot_state_block(self, gid: int, blk: int, payload: bytes) -> None:
+        """快照字节直写引擎状态槽(compute stream)。
+
+        目标 = kv_cache 张量的 blk 块(load Pass-2 的状态槽 = prev_state_idx
+        块,round-4 槽位语义);字节与 dump 侧同源(component-major 下整块 =
+        conv+ssm+v 完整 page)。``copy_`` 提交到 compute stream,引擎后续
+        do_mamba_copy_block 同流顺序执行,无跨流竞态(round-4 教训)。
+        """
+        layer_name = self._snapshot_state_layer_name(gid)
+        if layer_name is None:
+            logger.warning("snapshot state write: layer missing for gid=%s", gid)
+            return
+        tensor = self.kv_caches.get(layer_name)
+        block = self._kv_cache_block(tensor, blk)
+        if block is None:
+            logger.warning(
+                "snapshot state write: block missing gid=%s blk=%s", gid, blk
+            )
+            return
+        expected = block.reshape(-1).numel() * block.element_size()
+        if len(payload) != expected:
+            logger.warning(
+                "snapshot state write: size mismatch gid=%s blk=%s "
+                "payload=%s expected=%s",
+                gid,
+                blk,
+                len(payload),
+                expected,
+            )
+            return
+        src = torch.from_numpy(np.frombuffer(payload, dtype=np.uint8))
+        block.reshape(-1).view(torch.uint8).copy_(src)
+        logger.debug(
+            "snapshot state write gid=%s blk=%s bytes=%s", gid, blk, len(payload)
+        )
+
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Bulk load override: MLA blocks shared hash, KDA blocks per-rank hash."""
         metadata = self._get_connector_metadata()
@@ -1827,6 +2050,21 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         # pending compute op is the mamba state copy — sync overhead is
         # negligible.
         self.device.synchronize()
+        # 阶段 2(7.6 R4): authoritative 时先按位置键 Get 状态快照;命中的
+        # 状态块从旧 store load 列表剔除(避免 store-stream DMA 与快照直写
+        # 同一块竞态,round-4 教训),改由快照字节直写引擎状态槽。
+        snapshot_payloads: dict[
+            str, list[tuple[int, int, bytes]]
+        ] = {}
+        if spec_table_authoritative_enabled():
+            try:
+                snapshot_payloads = self._collect_snapshot_load_payloads(metadata)
+            except Exception as e:
+                logger.error(
+                    "snapshot load payload collect failed. %s: %s",
+                    type(e).__name__,
+                    e,
+                )
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -1841,6 +2079,21 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 num_loaded_block -= len(request.load_block_ids[0])
                 num_loaded_request -= 1
                 continue
+            # 快照命中的状态块从旧 store load 列表剔除(见上注解)。
+            hit = snapshot_payloads.get(request_id)
+            if hit:
+                skip_blk_ids = {blk for _gid, blk, _payload in hit}
+                keep = [
+                    i
+                    for i, blk_id in enumerate(scoped_vllm)
+                    if blk_id not in skip_blk_ids
+                ]
+                if len(keep) != len(scoped_vllm):
+                    scoped_ucm = [scoped_ucm[i] for i in keep]
+                    scoped_vllm = [scoped_vllm[i] for i in keep]
+                    num_loaded_block -= len(request.load_block_ids[0]) - len(
+                        scoped_ucm
+                    )
             num_loaded_block -= len(request.load_block_ids[0]) - len(scoped_ucm)
             try:
                 ptrs = self.kv_cache_layout.extract_block_addrs(scoped_vllm)
@@ -1883,6 +2136,17 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 )
                 self._connector_worker_meta.mark_failed(request_id)
                 num_loaded_block -= request_to_load_blocks.get(request_id, 0)
+
+        # 阶段 2(7.6 R4): 快照字节直写引擎状态槽(compute stream,引擎
+        # do_mamba_copy_block 同流顺序执行,无跨流竞态)。
+        for request_id, entries in snapshot_payloads.items():
+            for gid, blk, payload in entries:
+                self._write_snapshot_state_block(gid, blk, payload)
+            num_snapshot_writes = len(entries)
+            logger.info_once(
+                f"[stage-2] snapshot load from SnapshotStore: "
+                f"request={request_id}, groups={num_snapshot_writes}"
+            )
 
         if is_load:
             load_end_time = time.perf_counter() * 1000
@@ -2206,6 +2470,22 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
         self._layerwise_save_bytes = 0
         self._load_block_counts.clear()
 
+        # 阶段 2(7.6 R4): authoritative 时先按位置键 Get 状态快照;命中的
+        # 状态块从旧 store load 列表剔除(避免 store-stream DMA 与快照直写
+        # 同一块竞态,round-4 教训),改由快照字节直写引擎状态槽。
+        snapshot_payloads: dict[
+            str, list[tuple[int, int, bytes]]
+        ] = {}
+        if spec_table_authoritative_enabled():
+            try:
+                snapshot_payloads = self._collect_snapshot_load_payloads(metadata)
+            except Exception as e:
+                logger.error(
+                    "snapshot load payload collect failed. %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -2215,6 +2495,17 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             )
             if not scoped_ucm:
                 continue
+            hit = snapshot_payloads.get(request_id)
+            if hit:
+                skip_blk_ids = {blk for _gid, blk, _payload in hit}
+                keep = [
+                    i
+                    for i, blk_id in enumerate(scoped_vllm)
+                    if blk_id not in skip_blk_ids
+                ]
+                if len(keep) != len(scoped_vllm):
+                    scoped_ucm = [scoped_ucm[i] for i in keep]
+                    scoped_vllm = [scoped_vllm[i] for i in keep]
             self.need_load = True
             self._load_block_counts[request_id] = len(scoped_ucm)
             self.request_data.append(
@@ -2236,6 +2527,17 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
             for idx in self.row_ids:
                 self._wait_row_load(idx, metadata)
             self._record_layerwise_load_bytes()
+
+        # 阶段 2(7.6 R4): 快照字节直写引擎状态槽(compute stream,引擎
+        # do_mamba_copy_block 同流顺序执行,无跨流竞态)。放在全部行 load
+        # 等待之后,与旧 store DMA 串行化,避免两路写同一块竞态。
+        for request_id, entries in snapshot_payloads.items():
+            for gid, blk, payload in entries:
+                self._write_snapshot_state_block(gid, blk, payload)
+            logger.info_once(
+                f"[stage-2] snapshot load from SnapshotStore: "
+                f"request={request_id}, groups={len(entries)}"
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata or not self.need_load:
@@ -2449,6 +2751,10 @@ class UCMHybridLinearAttentionLayerWiseConnector(UCMHybridLinearAttentionConnect
                 metadata = self._get_connector_metadata()
                 assert isinstance(metadata, UCMConnectorMetadata)
                 self._register_snapshot_checkpoints_from_meta(metadata)
+                # 阶段 2(7.6 R4): 状态块字节按 (位置, 前缀哈希) 位置键
+                # Put 进 SnapshotStore(dump 双写;load 侧 authoritative
+                # 由同一位置键 Get 直写引擎状态槽)。
+                self._store_snapshot_payloads_from_meta(metadata)
             except Exception as e:
                 logger.error(
                     "register snapshot checkpoints failed. %s: %s",

@@ -44,6 +44,7 @@ on_get_miss),不 import 协调器层,保持 store 层不依赖集成层。
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -51,6 +52,7 @@ __all__ = [
     "SnapshotEntry",
     "SnapshotStore",
     "SnapshotGroup",
+    "shared_snapshot_store",
 ]
 
 # 无条目可用的哨兵(与协调器 NO_CHECKPOINT 语义一致)。
@@ -301,3 +303,37 @@ class SnapshotGroup:
 
 # 供协调器复用的类型别名(6.6.2 边界: 协调器懂模型、不碰字节)。
 BoundarySelector = Callable[[int, bytes], Optional[bytes]]
+
+
+# 进程内共享快照存储注册表(7.6 R4 "字节经 SnapshotStore 走位")。
+#
+# vLLM v1 单进程(TP=1,worker 内联)下同一模块被实例化两次: worker(dump Put)
+# 与 SCHEDULER(查询/load Get)。两侧各持一个 SnapshotStore 时,Put 与 Get
+# 互相看不见,快照字节恒 miss -> 退化为旧路径。以组几何指纹 (lcm, group_id)
+# 做进程内 get-or-create,保证两侧引用同一存储对象(与
+# ``kv_spec_table.shared_checkpoint_directory`` 同构,见 4.3)。多进程部署时
+# 各进程持有自己的存储,与目录"按引擎进程各自持有"一致。
+_snapshot_store_registry: dict[tuple[int, int], "SnapshotStore"] = {}
+_snapshot_store_registry_lock = threading.Lock()
+
+
+def shared_snapshot_store(
+    group_key: tuple[int, int],
+    group_name: str,
+    *,
+    root_dir: Optional[os.PathLike] = None,
+) -> SnapshotStore:
+    """进程内共享的快照存储(get-or-create)。
+
+    ``group_key`` = (lcm_block_size, group_id) 组几何指纹,与
+    ``shared_checkpoint_directory`` 的键同源(4.3 位置键的"组"维度)。
+    ``group_name`` 仅用于日志/注解;stored 按几何指纹单例化。
+    """
+    with _snapshot_store_registry_lock:
+        store = _snapshot_store_registry.get(group_key)
+        if store is None:
+            store = SnapshotStore(
+                group_name, max_entries=None, root_dir=root_dir
+            )
+            _snapshot_store_registry[group_key] = store
+        return store
