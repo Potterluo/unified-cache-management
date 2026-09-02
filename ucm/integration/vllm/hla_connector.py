@@ -25,7 +25,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ucm.integration.vllm.device import create_device
-from ucm.integration.vllm.spec_table_builder import spec_table_double_run_enabled
+from ucm.integration.vllm.spec_table_builder import (
+    spec_table_authoritative_enabled,
+    spec_table_double_run_enabled,
+)
 from ucm.integration.vllm.ucm_connector import (
     KVCacheLayout,
     PendingDumpTask,
@@ -299,11 +302,40 @@ class KVCacheGroupManager:
         lookup_on_prefix: Callable[[list[bytes]], int],
         lookup_on_reverse: Callable[[list[bytes]], int],
     ) -> tuple[int, int, list[bytes]]:
-        """Two-stage HLA lookup(旧逻辑为准)。
+        """Two-stage HLA lookup.
 
         双跑开启(UCM_SPEC_TABLE_DOUBLE_RUN=1)时,额外用规格表 + ``resolve_hit``
         复算链式命中长度并记账比对(4.4 C2 的行为等价回归);旧逻辑结果不变。
+
+        切新开启(UCM_SPEC_TABLE_AUTHORITATIVE=1)时,链式命中长度以
+        ``resolve_hit``(规格表组件投票,4.2)为准,旧逻辑 Stage-1 转 shadow 记账;
+        快照 p* 仍走旧 reverse scan(阶段 2 SnapshotStore 落地后一并切换)。
         """
+        authoritative_enabled = spec_table_authoritative_enabled()
+        if authoritative_enabled and self._spec_table_double_run is not None:
+            result = self._lookup_external_hit_tokens_authoritative(
+                num_computed_tokens,
+                group_block_ids,
+                lookup_on_prefix,
+                lookup_on_reverse,
+            )
+            # 即使切新,仍用旧逻辑 shadow 记账比对,不一致照常告警。
+            if spec_table_double_run_enabled():
+                try:
+                    self._double_run_shadow_resolve(
+                        num_computed_tokens,
+                        group_block_ids,
+                        lookup_on_prefix,
+                        result,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "[authoritative] shadow legacy ledger failed. %s: %s",
+                        type(e).__name__,
+                        e,
+                    )
+            return result
+
         result = self._lookup_external_hit_tokens_legacy(
             num_computed_tokens,
             group_block_ids,
@@ -325,6 +357,48 @@ class KVCacheGroupManager:
                     e,
                 )
         return result
+
+    def _lookup_external_hit_tokens_authoritative(
+        self,
+        num_computed_tokens: int,
+        group_block_ids: list[list[bytes]],
+        lookup_on_prefix: Callable[[list[bytes]], int],
+        lookup_on_reverse: Callable[[list[bytes]], int],
+    ) -> tuple[int, int, list[bytes]]:
+        """Authoritative: 链式 l 由 ``resolve_hit`` 决定,快照 p* 仍旧 reverse scan。
+
+        规格表(``self._spec_table_double_run``)必须非 None(由
+        ``KVCacheGroupManager`` 初始化;否则退化为 legacy)。
+        """
+        from ucm.integration.vllm.kv_spec_table import CheckpointDirectory, resolve_hit
+
+        spec = self._spec_table_double_run
+        row_ids = {row.group_name: i for i, row in enumerate(spec.rows)}
+        # 阶段 1 快照检查点目录为空(阶段 2 才接入 SnapshotStore);这里只需
+        # resolve_hit 的链式 l,快照 p* 仍由旧 Stage-2 reverse scan 决定。
+        checkpoints = {}
+
+        def existence_by_chain(row, block_ids):
+            gi = row_ids[row.group_name]
+            bs = row.block_size
+            external = group_block_ids[gi][num_computed_tokens // bs :]
+            if not external:
+                return num_computed_tokens
+            hit_blocks = lookup_on_prefix(external) + 1
+            return num_computed_tokens + max(hit_blocks, 0) * bs
+
+        chain_l, _ = resolve_hit(spec, {}, existence_by_chain, checkpoints)
+        chain_l = max(chain_l, num_computed_tokens)
+        # 对齐:resolve_hit 已对 LCM 向下取整,但保守再对齐一次。
+        chain_l = (chain_l // self.lcm_block_size) * self.lcm_block_size
+
+        return self._lookup_external_hit_tokens_legacy(
+            num_computed_tokens,
+            group_block_ids,
+            lookup_on_prefix,
+            lookup_on_reverse,
+            chain_absolute_l=chain_l,
+        )
 
     def _double_run_shadow_resolve(
         self,
@@ -406,6 +480,8 @@ class KVCacheGroupManager:
         group_block_ids: list[list[bytes]],
         lookup_on_prefix: Callable[[list[bytes]], int],
         lookup_on_reverse: Callable[[list[bytes]], int],
+        *,
+        chain_absolute_l: Optional[int] = None,
     ) -> tuple[int, int, list[bytes]]:
         """Two-stage HLA lookup using precomputed per-group hashes.
 
@@ -417,6 +493,12 @@ class KVCacheGroupManager:
         as a min and rounded down to ``lcm_block_size`` so the final
         external hit is consistent across all full-attn groups and aligns
         to the kv-cache page granularity expected by the scheduler.
+
+        When ``chain_absolute_l`` is provided (authoritative mode,
+        ``UCM_SPEC_TABLE_AUTHORITATIVE=1``), Stage 1 is skipped: the chain
+        candidate comes from ``resolve_hit`` (规格表组件投票,4.2) instead,
+        and the value is used as the absolute chain hit length. Stage 2
+        (mamba-state reverse scan) still runs unchanged.
 
         Stage 2 — mamba-align state groups are checked via
         ``lookup_on_reverse``: for each state group, the state hashes at
@@ -445,35 +527,45 @@ class KVCacheGroupManager:
             f"lcm_block_size={self.lcm_block_size}"
         )
 
-        # Stage 1: each full-attn group contributes a candidate hit count.
-        candidates: list[int] = []
-        for fa in self.full_attn_groups:
-            fa_block_ids = group_block_ids[fa.group_id]
-            fa_hbm_blocks = num_computed_tokens // fa.block_size
-            fa_external = fa_block_ids[fa_hbm_blocks:]
-            if not fa_external:
-                candidates.append(0)
-                continue
-            try:
-                fa_hit_blocks = lookup_on_prefix(fa_external) + 1
-            except Exception as e:
-                logger.error(
-                    f"full-attn group {fa.group_id} lookup error. "
-                    f"{type(e).__name__}: {e}"
-                )
-                _record_counter("connector_lookup_errors_total")
-                candidates.append(0)
-                continue
-            candidates.append(max(fa_hit_blocks, 0) * fa.block_size)
+        if chain_absolute_l is not None:
+            # Authoritative mode: chain length decided by resolve_hit (4.2)。
+            assert chain_absolute_l % self.lcm_block_size == 0, (
+                f"chain_absolute_l={chain_absolute_l} is not aligned to "
+                f"lcm_block_size={self.lcm_block_size}"
+            )
+            external_hit_tokens = chain_absolute_l - num_computed_tokens
+            if external_hit_tokens <= 0:
+                return 0, 0, []
+        else:
+            # Stage 1: each full-attn group contributes a candidate hit count.
+            candidates: list[int] = []
+            for fa in self.full_attn_groups:
+                fa_block_ids = group_block_ids[fa.group_id]
+                fa_hbm_blocks = num_computed_tokens // fa.block_size
+                fa_external = fa_block_ids[fa_hbm_blocks:]
+                if not fa_external:
+                    candidates.append(0)
+                    continue
+                try:
+                    fa_hit_blocks = lookup_on_prefix(fa_external) + 1
+                except Exception as e:
+                    logger.error(
+                        f"full-attn group {fa.group_id} lookup error. "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    _record_counter("connector_lookup_errors_total")
+                    candidates.append(0)
+                    continue
+                candidates.append(max(fa_hit_blocks, 0) * fa.block_size)
 
-        # Resume boundary must be a multiple of lcm_block_size so every
-        # group's tail/dispatch slicing lands on a real block boundary.
-        min_external_hit_tokens = min(candidates)
-        external_hit_tokens = (
-            min_external_hit_tokens // self.lcm_block_size
-        ) * self.lcm_block_size
-        if external_hit_tokens <= 0:
-            return 0, 0, []
+            # Resume boundary must be a multiple of lcm_block_size so every
+            # group's tail/dispatch slicing lands on a real block boundary.
+            min_external_hit_tokens = min(candidates)
+            external_hit_tokens = (
+                min_external_hit_tokens // self.lcm_block_size
+            ) * self.lcm_block_size
+            if external_hit_tokens <= 0:
+                return 0, 0, []
 
         # Stage 2: reverse scan for mamba state at LCM boundaries.
         # For each state group, collect state hashes at all candidate

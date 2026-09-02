@@ -283,6 +283,17 @@ class DoubleRunFlagTest(unittest.TestCase):
         finally:
             del os.environ["UCM_SPEC_TABLE_DOUBLE_RUN"]
 
+    def test_authoritative_flag_parsing(self):
+        self.assertFalse(spec_table_builder.spec_table_authoritative_enabled())
+        os.environ["UCM_SPEC_TABLE_AUTHORITATIVE"] = "true"
+        try:
+            self.assertTrue(spec_table_builder.spec_table_authoritative_enabled())
+        finally:
+            del os.environ["UCM_SPEC_TABLE_AUTHORITATIVE"]
+        os.environ["UCM_SPEC_TABLE_AUTHORITATIVE"] = "off"
+        self.assertFalse(spec_table_builder.spec_table_authoritative_enabled())
+        del os.environ["UCM_SPEC_TABLE_AUTHORITATIVE"]
+
 
 class LegacyChainCandidateTest(unittest.TestCase):
     """4.4 C1 记账基准: legacy_chain_candidate_l 纯函数与旧 Stage-1 数学一致。

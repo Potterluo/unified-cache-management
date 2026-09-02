@@ -60,11 +60,26 @@ from ucm.integration.vllm.kv_spec_table import (
 
 # 当 UCM_SPEC_TABLE_DOUBLE_RUN 开启时执行双跑记账(默认关闭,零行为影响)。
 _DOUBLE_RUN_FLAG = "UCM_SPEC_TABLE_DOUBLE_RUN"
+# 当 UCM_SPEC_TABLE_AUTHORITATIVE 开启时,resolve_hit 成为链式命中主裁决,
+# 旧逻辑转 shadow 记账(4.4 C1 双跑对齐后方可开启;默认关闭 = 旧逻辑为准)。
+_AUTHORITATIVE_FLAG = "UCM_SPEC_TABLE_AUTHORITATIVE"
 
 
 def spec_table_double_run_enabled() -> bool:
     """双跑开关: ``UCM_SPEC_TABLE_DOUBLE_RUN`` 为 1/true/yes/on 时开启。"""
     value = os.getenv(_DOUBLE_RUN_FLAG, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def spec_table_authoritative_enabled() -> bool:
+    """切新开关: ``UCM_SPEC_TABLE_AUTHORITATIVE`` 为 1/true/yes/on 时开启。
+
+    开启后 ``resolve_hit``(规格表组件投票 + 检查点目录)成为链式命中裁决的
+    主路径,旧 ``_lookup_external_hit_tokens_legacy`` 的链式候选转 shadow 记账
+    (不一致仍告警,但执行以新逻辑为准)。快照 p* 仍走旧 reverse scan(阶段 2
+    SnapshotStore + 检查点目录落地后一并切换)。
+    """
+    value = os.getenv(_AUTHORITATIVE_FLAG, "0").strip().lower()
     return value in ("1", "true", "yes", "on")
 
 
