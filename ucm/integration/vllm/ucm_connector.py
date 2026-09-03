@@ -2535,45 +2535,6 @@ class UCMCPConnector(UCMLayerWiseConnector):
             super(UCMLayerWiseConnector, self).wait_for_save()
 
 
-class UCMPDConnector(UCMDirectConnector):
-    """
-    This Connector means overlap (especially for Decode Instance):
-    step (req0,1,2) forward -> step (req0,1,2,3) forward
-    load req3               -> load req4
-    """
-
-    def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        role: KVConnectorRole,
-        kv_cache_config: Optional["KVCacheConfig"] = None,
-    ):
-        super().__init__(vllm_config, role, kv_cache_config)
-
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        raise NotImplementedError
-
-    def get_finished(
-        self, finished_req_ids: set[str]
-    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        """
-        Notifies worker-side connector ids of requests that have
-        finished generating tokens.
-
-        Returns:
-            ids of requests that have finished asynchronous transfer
-            (requests that previously returned True from request_finished()),
-            tuple of (sending/saving ids, recving/loading ids).
-            The finished saves/sends req ids must belong to a set provided in a
-            call to this method (this call or a prior one).
-        """
-        raise NotImplementedError
-
-
 class UCMMockConnector(UCMDirectConnector):
     """
     This Connector can control hit ratio, for example: if your hit ratio is 100%,
