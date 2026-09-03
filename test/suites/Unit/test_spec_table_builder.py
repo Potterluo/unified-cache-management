@@ -619,5 +619,64 @@ class WindowGroupSpecTest(unittest.TestCase):
             spec_table_builder.build_spec_table(groups, layer_compress_ratios=None)
 
 
+class UnitTypeFromEngineTest(unittest.TestCase):
+    """7.3/7.6 R9: 层→单位映射必须来自引擎声明(shared_by/窗口/YOCO)。"""
+
+    def _tensor(self, *shared_by):
+        return SimpleNamespace(shared_by=list(shared_by))
+
+    def test_row_unit_from_shared_tensor(self):
+        groups = [_group(fake_vllm.MLAAttentionSpec(128),
+                         layer_names=("layers.0.a", "layers.1.b"))]
+        tensors = [self._tensor("layers.0.a", "layers.1.b")]
+        table = spec_table_builder.build_spec_table(
+            groups, kv_cache_tensors=tensors
+        )
+        row = table.rows[0]
+        self.assertEqual(row.unit_type.value, "row")
+        self.assertEqual(
+            set(row.unit_layer_names), {"layers.0.a", "layers.1.b"}
+        )
+
+    def test_window_unit_from_sliding_window(self):
+        groups = [
+            _group(
+                fake_vllm.MLAAttentionSpec(
+                    block_size=32, sliding_window=2048
+                ),
+                layer_names=("layers.2.swa_cache",),
+            )
+        ]
+        table = spec_table_builder.build_spec_table(groups)
+        self.assertEqual(table.rows[0].unit_type.value, "window")
+
+    def test_follow_unit_from_yoco_target(self):
+        group = SimpleNamespace(
+            layer_names=("layers.3.alias",),
+            kv_cache_spec=fake_vllm.FullAttentionSpec(128),
+            kv_sharing_target_layer_name="layers.0.target",
+        )
+        table = spec_table_builder.build_spec_table([group])
+        self.assertEqual(table.rows[0].unit_type.value, "follow")
+        self.assertEqual(table.rows[0].unit_layer_names, ("layers.0.target",))
+
+    def test_default_layer_unit(self):
+        groups = [
+            _group(fake_vllm.FullAttentionSpec(128),
+                   layer_names=("layers.0.kv_cache",))
+        ]
+        table = spec_table_builder.build_spec_table(groups)
+        self.assertEqual(table.rows[0].unit_type.value, "layer")
+
+    def test_no_tensors_falls_back_to_layer(self):
+        # 不传 kv_cache_tensors 时即使有多层组也不推断 ROW(引擎声明缺失)。
+        groups = [
+            _group(fake_vllm.MLAAttentionSpec(128),
+                   layer_names=("layers.0.a", "layers.1.b"))
+        ]
+        table = spec_table_builder.build_spec_table(groups)
+        self.assertEqual(table.rows[0].unit_type.value, "layer")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_interface import (
 from ucm.integration.vllm.kv_spec_table import (
     CacheKind,
     RankRule,
+    UnitType,
     RetentionPolicy,
     SpecRow,
     SpecTable,
@@ -255,11 +256,41 @@ def legacy_chain_candidate_l(
     return num_computed_tokens + external_hit_tokens
 
 
+def unit_type_from_engine(
+    group,
+    kv_cache_tensors: Optional[Sequence],
+) -> tuple["UnitType", tuple[str, ...]]:
+    """存取单位映射(7.3 / 7.6 R9): 层→单位必须来自引擎声明,禁止层名推断。
+
+    判定顺序(引擎声明优先):
+    - FOLLow: 组任一层声明 ``kv_sharing_target_layer_name``(YOCO 跟随);
+    - ROW:    组全部层同属一个多成员共享张量(``shared_by`` 长度 >1);
+    - WINDOW: 组规格带滑动窗口(窗口组级单位,与层解耦);
+    - LAYER:  其余每层独立。
+    返回 (unit_type, 单位层列表);无引擎张量声明时全部回退 LAYER。
+    """
+    layer_names = tuple(group.layer_names or ())
+    target = getattr(group, "kv_sharing_target_layer_name", None)
+    if target:
+        return UnitType.FOLLOW, (target,)
+    if kv_cache_tensors is not None:
+        for tensor in kv_cache_tensors:
+            shared_by = tuple(getattr(tensor, "shared_by", ()) or ())
+            if len(shared_by) > 1 and layer_names and set(layer_names) <= set(
+                shared_by
+            ):
+                return UnitType.ROW, shared_by
+    if sliding_window_from_spec(group.kv_cache_spec) is not None:
+        return UnitType.WINDOW, layer_names
+    return UnitType.LAYER, layer_names
+
+
 def build_spec_table(
     kv_cache_groups: Sequence,
     *,
     group_seeds: Optional[Sequence[str]] = None,
     layer_compress_ratios: Optional[Sequence[int]] = None,
+    kv_cache_tensors: Optional[Sequence] = None,
 ) -> SpecTable:
     """从 vLLM ``KVCacheConfig.kv_cache_groups`` 构建规格表(4.1)。
 
@@ -268,6 +299,9 @@ def build_spec_table(
     ``layer_compress_ratios``: 可选的每层压缩比(hf_config.compress_ratios),
     用于折算 WA 组的 UCM 尾长(``tail_tokens`` 列);缺省时 WA 行尾长取
     sliding_window(swa_cache 张量)或留空交由连接器在归属时裁决。
+    ``kv_cache_tensors``: 引擎 ``KVCacheConfig.kv_cache_tensors``(可选),用于
+    填充存取单位列(7.3 / R9: shared_by 跨层共享 → ROW 单位);缺省时全部
+    回退 LAYER。
     """
     rows: list[SpecRow] = []
     for group_id, group in enumerate(kv_cache_groups):
@@ -303,6 +337,10 @@ def build_spec_table(
                     group.layer_names,
                     layer_compress_ratios,
                 ),
+                unit_type=unit_type_from_engine(group, kv_cache_tensors)[0],
+                unit_layer_names=unit_type_from_engine(
+                    group, kv_cache_tensors
+                )[1],
             )
         )
     return SpecTable(rows)

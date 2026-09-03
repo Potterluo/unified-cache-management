@@ -1066,6 +1066,10 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
     """Worker-to-scheduler metadata for load failures and Dump success."""
 
     is_mla: bool = False
+    # 秩规则列运行时消费(4.2/C4): 规格表首位链式组的 rank_rule
+    # (ALL_UNION=任一 rank dump 成功即可 / ALL_INTERSECT=全 rank 必达)。
+    # 由连接器在构造时从规格表填充;None = 无规格表,回退旧 is_mla 语义。
+    rank_rule: Optional[str] = None
     load_failed_reqs: set[str] = field(default_factory=set)
     missing_reqs: set[str] = field(default_factory=set)
     missing_blocks: set[bytes] = field(default_factory=set)
@@ -1090,7 +1094,15 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
         # for mla, blocks can only be dumped by 1 rank, for FAWA, the dump is distributed across ranks
         # for non-mla, blocks should be dumped by all ranks
         # so for mla, aggregation logic is union, for non-mla, aggregation is intersection
-        if self.is_mla:
+        if self.rank_rule is not None:
+            # 规格表权威(rank_block_present 的批量 set 等价,4.5 算例 B)。
+            if self.rank_rule == "all_union":
+                self.dump_succeeded_blocks.update(other.dump_succeeded_blocks)
+            else:
+                self.dump_succeeded_blocks.intersection_update(
+                    other.dump_succeeded_blocks
+                )
+        elif self.is_mla:
             self.dump_succeeded_blocks.update(other.dump_succeeded_blocks)
         else:
             self.dump_succeeded_blocks.intersection_update(other.dump_succeeded_blocks)
@@ -1106,6 +1118,24 @@ class UCMDirectConnector(KVConnectorBase_V1):
     RankConsistencyManager. It owns StoreNotFoundError classification and
     cross-rank consistency metadata.
     """
+    def _primary_rank_rule_value(self) -> Optional[str]:
+        """规格表首位链式组的秩规则值(worker 聚合权威源,4.2/C4)。
+
+        连接器侧从 group_manager 或自身规格表取;无规格表返回 None。
+        """
+        spec_table = None
+        group_manager = getattr(self, "group_manager", None)
+        if group_manager is not None:
+            spec_table = getattr(group_manager, "_spec_table_double_run", None)
+        if spec_table is None:
+            # hma/FAWA 直接持有规格表(非 group_manager 形态)。
+            spec_table = getattr(self, "_spec_table_double_run", None)
+        if spec_table is not None:
+            rule = spec_table.primary_chain_rank_rule
+            return rule.value if rule is not None else None
+        return None
+
+
 
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
@@ -1214,7 +1244,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 vllm_config,
                 self.tp_rank % self.tp_size,
             )
-            self._connector_worker_meta = UCMWorkerMetadata(is_mla=self.is_mla)
+            self._connector_worker_meta = UCMWorkerMetadata(
+                is_mla=self.is_mla,
+                rank_rule=self._primary_rank_rule_value(),
+            )
 
         self._rank_consistency = RankConsistencyManager(
             is_scheduler=role == KVConnectorRole.SCHEDULER,

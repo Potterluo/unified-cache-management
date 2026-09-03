@@ -54,6 +54,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 __all__ = [
     "CacheKind",
     "RankRule",
+    "UnitType",
     "RetentionPolicy",
     "SpecRow",
     "SpecTable",
@@ -99,6 +100,22 @@ class RankRule(str, Enum):
     ALL_INTERSECT = "all_intersect"
 
 
+class UnitType(str, Enum):
+    """存取单位类型(7.3 / 7.6 R9): "层"不是唯一刻度,单位由引擎声明驱动。
+
+    LAYER    每层独立 (层, 块): MHA/GQA/MLA、线性注意力、mamba 状态、KDA。
+    WINDOW   窗口/组级(与层解耦): SWA 同 spec 层共享窗口槽位、压缩池 C4/C128。
+    ROW      跨层共享张量: 引擎 raw tensor 被整组层共享(shared_by 多成员),
+             行内层共享同一块页,行尾层触发整行存取。
+    FOLLOW   数据真共享(YOCO): 层别名跟随目标层,不存自己的数据。
+    """
+
+    LAYER = "layer"
+    WINDOW = "window"
+    ROW = "row"
+    FOLLOW = "follow"
+
+
 @dataclass(frozen=True)
 class RetentionPolicy:
     """快照组的保留策略(4.3): 在哪些位置创建检查点,三触发。
@@ -135,6 +152,12 @@ class SpecRow:
     # UCM 侧该组保留的尾 token 数(仅 WA 组必须声明;FA 组默认 None)。
     # 由构建方折算引擎张量名/层压缩比后填入,连接器只读此列。
     tail_tokens: Optional[int] = None
+    # 存取单位类型与构成(7.3 / 7.6 R9): 层→单位映射必须来自引擎声明
+    # (shared_by / 窗口组 / kv_sharing_target_layer_name),禁止从层名推断。
+    # 默认 LAYER(每层独立);构建方按引擎张量声明填充。
+    unit_type: UnitType = UnitType.LAYER
+    # 该单位由哪些层构成(ROW 单位 = 共享张量的 shared_by 层列表)。
+    unit_layer_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind is CacheKind.NONE:
@@ -166,6 +189,17 @@ class SpecTable:
 
     def row(self, group_name: str) -> SpecRow:
         return self._by_name[group_name]
+
+    @property
+    def primary_chain_rank_rule(self) -> Optional[RankRule]:
+        """首位链式组的秩规则(4.2 聚合语义的权威源)。
+
+        worker 跨 rank dump 聚合按此列取并/交(秩规则列运行时消费,C4);
+        无链式行(纯快照模型)时返回 None,调用方回退旧 is_mla 语义。
+        """
+        if not self.chain_rows:
+            return None
+        return self.chain_rows[0].rank_rule
 
     @property
     def lcm_block_size(self) -> int:
