@@ -43,8 +43,10 @@ on_get_miss),不 import 协调器层,保持 store 层不依赖集成层。
 
 from __future__ import annotations
 
+import math
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -66,8 +68,31 @@ class SnapshotEntry:
     payload: bytearray = field(default_factory=bytearray)
     # 热度(CLOCK-1bit 的近似,6.6.1/附录 E1 的演进方向);Touch 只做脉冲累加。
     heat: int = 0
+    # 最近访问时间(monotonic): 位置价值淘汰的"频率×时间"里"时间"半边
+    # (5.2 Gap 初版;Get/Touch/Put 都刷新)。
+    last_touch: float = 0.0
     # 所有权: Put/Donate 写方移交后由 store 持有;Get 永不转移所有权(CoW)。
     owner: bool = True
+
+
+def position_value_score(
+    heat: int,
+    age: float,
+    half_life: float = 3600.0,
+    recency_weight: float = 1.0,
+) -> float:
+    """位置价值评分(5.2 Gap / 8.3): 值 = 频率 × 时间衰减。
+
+    - ``heat``: 访问频率(CLOCK 脉冲累加);
+    - ``age``: 距上次访问的秒数(monotonic);
+    - ``half_life``: 时间衰减半衰期(秒),``exp(-age/half_life)``;
+    - ``recency_weight``: 频率与时效的权重比(>1 更重频率)。
+
+    单调性: 热且新 > 冷且旧;同 heat 下 age 小者分高;同 age 下 heat
+    高者分高。供位置价值淘汰按最低分逐出(快照"未来可能被续上"的概率
+    代理,设计文档 6.4 对 Mooncake pin 的拒绝理由同一出处)。
+    """
+    return heat**recency_weight * math.exp(-age / max(half_life, 1e-9))
 
 
 class SnapshotStore:
@@ -161,10 +186,17 @@ class SnapshotStore:
         key = (position, prefix_hash)
         if key in self._entries:
             return False
-        self._entries[key] = SnapshotEntry(payload=bytearray(payload), heat=1)
+        self._entries[key] = SnapshotEntry(
+            payload=bytearray(payload), heat=1, last_touch=_monotonic()
+        )
         self._write_file(position, prefix_hash, payload)
         self._evict_if_over_capacity()
         return True
+
+    def _refresh_touch(self, key: tuple[int, bytes]) -> None:
+        entry = self._entries.get(key)
+        if entry is not None:
+            entry.last_touch = _monotonic()
 
     def get(self, position: int, prefix_hash: bytes) -> Optional[bytes]:
         """Get(=CoW): 命中则返回**副本**并累加热度;未命中返回 None。
@@ -180,6 +212,7 @@ class SnapshotStore:
             entry = SnapshotEntry(payload=bytearray(disk_payload), heat=0)
             self._entries[(position, prefix_hash)] = entry
         entry.heat += 1
+        entry.last_touch = _monotonic()
         return bytes(entry.payload)
 
     def donate(self, position: int, prefix_hash: bytes, payload: bytearray) -> bool:
@@ -190,7 +223,9 @@ class SnapshotStore:
         key = (position, prefix_hash)
         if key in self._entries:
             return False
-        self._entries[key] = SnapshotEntry(payload=payload, heat=0, owner=True)
+        self._entries[key] = SnapshotEntry(
+            payload=payload, heat=0, owner=True, last_touch=_monotonic()
+        )
         self._write_file(position, prefix_hash, bytes(payload))
         self._evict_if_over_capacity()
         return True
@@ -209,6 +244,7 @@ class SnapshotStore:
             if prefix_hash is not None and ph != prefix_hash:
                 continue
             entry.heat += 1
+            entry.last_touch = _monotonic()
 
     def heat_rank(self) -> list[tuple[int, bytes, int]]:
         """按热度升序返回 (位置, 前缀哈希, heat),供位置价值淘汰决策。"""
@@ -216,6 +252,28 @@ class SnapshotStore:
             ((pos, ph, e.heat) for (pos, ph), e in self._entries.items()),
             key=lambda x: x[2],
         )
+
+    def evict_lowest_value(
+        self, limit: int = 1, half_life: float = 3600.0, now: Optional[float] = None
+    ) -> list[tuple[int, bytes]]:
+        """位置价值淘汰(5.2 Gap 初版): 逐出 position_value_score 最低条目。
+
+        频率(heat)与时效(age)联合排序,替代纯热度排序;返回被逐出的键
+        (调用方对检查点目录做 on_get_miss,4.3 惰性失效闭环)。持久化条目
+        同时删除盘上文件。
+        """
+        now = _monotonic() if now is None else now
+        scored = [
+            (pos, ph, position_value_score(e.heat, now - e.last_touch, half_life))
+            for (pos, ph), e in self._entries.items()
+        ]
+        scored.sort(key=lambda x: x[2])
+        evicted: list[tuple[int, bytes]] = []
+        for pos, ph, _score in scored[:limit]:
+            self._entries.pop((pos, ph), None)
+            self._remove_file(pos, ph)
+            evicted.append((pos, ph))
+        return evicted
 
     def evict_lowest_heat(self, limit: int = 1) -> list[tuple[int, bytes]]:
         """位置价值淘汰(开放项,附录 E9 方向): 逐出热度最低条目。
@@ -303,6 +361,11 @@ class SnapshotGroup:
 
 # 供协调器复用的类型别名(6.6.2 边界: 协调器懂模型、不碰字节)。
 BoundarySelector = Callable[[int, bytes], Optional[bytes]]
+
+
+def _monotonic() -> float:
+    """单测可打点的单调时钟(Python 3.7+ 语义,time.monotonic 包装)。"""
+    return time.monotonic()
 
 
 # 进程内共享快照存储注册表(7.6 R4 "字节经 SnapshotStore 走位")。

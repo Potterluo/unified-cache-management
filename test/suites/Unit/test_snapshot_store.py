@@ -28,6 +28,7 @@ SnapshotGroup 惰性失效(4.3),断言口径与 9.1 阶段 2 一致。
 与 test_kv_spec_table 相同的零依赖加载方式(importlib 直接加载模块文件)。
 """
 
+import math
 import importlib.util
 import sys
 import unittest
@@ -164,6 +165,47 @@ class SnapshotStoreTest(unittest.TestCase):
             s2 = SnapshotStore("mamba2", root_dir=tmp)
             self.assertIsNone(s2.get(1024, b"p"))  # 读盘 miss
             self.assertEqual(s2.get(2048, b"p"), b"b")  # 未淘汰条目可读回
+
+
+class PositionValueEvictionTest(unittest.TestCase):
+    """5.2 Gap 初版: 快照位置价值 = 频率 × 时间衰减。"""
+
+    def test_score_monotonic_heat_and_age(self):
+        score = snapshot_store.position_value_score
+        # 热且新 > 冷且旧
+        self.assertGreater(score(10, age=1), score(1, age=1e6))
+        # 同 heat 下 age 小者分高
+        self.assertGreater(score(5, age=10), score(5, age=1000))
+        # 同 age 下 heat 高者分高
+        self.assertGreater(score(7, age=100), score(2, age=100))
+        # 半衰期: 一个半衰期后价值 ~一半(时间维衰减)
+        self.assertAlmostEqual(
+            score(1, 0) / score(1, 3600), math.e, delta=0.01
+        )
+
+    def test_evict_lowest_value_picks_coldest_coldest(self):
+        store = snapshot_store.SnapshotStore("g1")
+        now = snapshot_store._monotonic()
+        store.put(100, b"a" * 8, b"A")  # heat=1, t=now
+        store.put(200, b"a" * 8, b"B")  # heat=1, t=now
+        # 让 (200,*) 变冷: 手动改 last_touch
+        store._entries[(200, b"a" * 8)].last_touch = now - 100000
+        evicted = store.evict_lowest_value(limit=1, now=now)
+        self.assertEqual(evicted, [(200, b"a" * 8)])
+        self.assertIn((100, b"a" * 8), store._entries)
+
+    def test_evict_lowest_value_frequency_overrides_age(self):
+        store = snapshot_store.SnapshotStore("g1")
+        now = snapshot_store._monotonic()
+        store.put(100, b"x" * 8, b"A")
+        store.put(200, b"x" * 8, b"B")
+        # 位置100 频率高(heat=9)但同样冷;位置200 频率低 -> 逐出 200
+        store._entries[(100, b"x" * 8)].heat = 9
+        store._entries[(200, b"x" * 8)].heat = 1
+        for key in store._entries:
+            store._entries[key].last_touch = now - 100000
+        evicted = store.evict_lowest_value(limit=1, now=now)
+        self.assertEqual(evicted, [(200, b"x" * 8)])
 
 
 class SharedSnapshotStoreTest(unittest.TestCase):
